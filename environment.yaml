@@ -1,0 +1,25 @@
+name: orbit-manifest
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  # build
+  - pybind11
+  - setuptools
+  - cmake
+  # numerics / science
+  - numpy
+  - scipy
+  - matplotlib
+  # networking / config
+  - requests
+  - python-dotenv
+  # TLE propagation (situational awareness layer)
+  - sgp4
+  # testing
+  - pytest
+  # Claude API (conda-forge lags behind; pin to pip)
+  - pip
+  - pip:
+    - anthropic
