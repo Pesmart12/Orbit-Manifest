@@ -52,11 +52,15 @@ arr py_propagate_batch(const arr& states0, double dt, int n_steps) {
     arr out({ (py::ssize_t)N, (py::ssize_t)(n_steps + 1), (py::ssize_t)6 });
     double* dst = out.mutable_data();
 
-    for (int i = 0; i < N; ++i) {
-        auto traj = propagate(initial[i], dt, n_steps);
-        for (int t = 0; t <= n_steps; ++t)
-            for (int j = 0; j < 6; ++j)
-                dst[i * (n_steps + 1) * 6 + t * 6 + j] = traj[t][j];
+    {
+        py::gil_scoped_release release;
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; ++i) {
+            auto traj = propagate(initial[i], dt, n_steps);
+            for (int t = 0; t <= n_steps; ++t)
+                for (int j = 0; j < 6; ++j)
+                    dst[i * (n_steps + 1) * 6 + t * 6 + j] = traj[t][j];
+        }
     }
     return out;
 }
@@ -74,7 +78,11 @@ arr py_propagate_batch_final(const arr& states0, double dt, int n_steps) {
         for (int j = 0; j < 6; ++j)
             initial[i][j] = src[i * 6 + j];
 
-    auto results = propagate_batch_final(initial, dt, n_steps);
+    std::vector<StateVector> results;
+    {
+        py::gil_scoped_release release;
+        results = propagate_batch_final(initial, dt, n_steps);
+    }
 
     arr out({ (py::ssize_t)N, (py::ssize_t)6 });
     double* dst = out.mutable_data();

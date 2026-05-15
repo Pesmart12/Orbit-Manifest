@@ -1,5 +1,6 @@
 #include "integrator.h"
 #include <cmath>
+#include <omp.h>
 
 StateVector compute_derivatives(const StateVector& s) {
     const double x  = s[0], y  = s[1], z  = s[2];
@@ -80,7 +81,8 @@ std::vector<StateVector> propagate_batch_final(
     const std::vector<StateVector>& states, double dt, int n_steps)
 {
     std::vector<StateVector> results(states.size());
-    for (std::size_t i = 0; i < states.size(); ++i)
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < (int)states.size(); ++i)
         results[i] = propagate_final(states[i], dt, n_steps);
     return results;
 }

@@ -26,6 +26,7 @@ if(NOT pybind11_FOUND)
 endif()
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module NumPy)
+find_package(OpenMP REQUIRED)
 
 pybind11_add_module(orbit_integrator
   integrator/integrator.cpp
@@ -36,5 +37,7 @@ target_include_directories(orbit_integrator PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/integrator
   ${Python_NumPy_INCLUDE_DIRS}
 )
+
+target_link_libraries(orbit_integrator PRIVATE OpenMP::OpenMP_CXX)
 
 install(TARGETS orbit_integrator DESTINATION .)
