@@ -160,13 +160,13 @@ Ground track and trajectory plots saved to `output/`.
 
 | Component | Status |
 |---|---|
-| C++ RK4 Integrator | 🔧 In progress |
-| pybind11 bindings | 🔧 In progress |
-| Situational Awareness | ⬜ Planned |
-| Constraint Solver | ⬜ Planned |
-| Orbital Optimizer | ⬜ Planned |
-| Claude API Agent | ⬜ Planned |
-| Output Composer | ⬜ Planned |
+| C++ RK4 Integrator | Implemented |
+| pybind11 bindings | Implemented |
+| Situational Awareness | In progress |
+| Constraint Solver | Planned |
+| Orbital Optimizer | Planned |
+| Claude API Agent | Planned |
+| Output Composer | Planned |
 
 ---
 
