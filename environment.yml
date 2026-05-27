@@ -1,0 +1,16 @@
+name: orbit-manifest
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - numpy
+  - scipy
+  - requests
+  - python-dotenv
+  - pybind11
+  - setuptools
+  - cmake
+  - pip
+  - pip:
+    - -r requirements.txt

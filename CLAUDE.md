@@ -38,11 +38,14 @@ orbit-manifest/
 │   ├── integrator.cpp    # RK4 + 2-body + J2 equations of motion
 │   └── bindings.cpp      # pybind11 numpy bindings
 ├── tests/
-│   └── test_integrator.py  # Validation: period, energy, J2 drift, batch
+│   ├── test_integrator.py  # Validation: period, energy, J2 drift, batch
+│   └── test_conjunction.py # Conjunction checker unit tests
 ├── agent/                # Claude API orchestration (not yet implemented)
 ├── solver/               # NL goal → orbital constraints (not yet implemented)
 ├── optimizer/            # scipy optimization loop (not yet implemented)
-├── awareness/            # TLE fetching + conjunction checks (not yet implemented)
+├── awareness/            # TLE fetching + conjunction checks
+│   ├── tle_fetcher.py    # Space-Track login, catalog pull, 24-hr disk cache
+│   └── conjunction.py    # SGP4 catalog vs RK4 mission orbit, threshold filter
 ├── output/               # Mission plan composition + plots (not yet implemented)
 ├── CMakeLists.txt        # C++ build config
 ├── setup.py              # pybind11 Python extension build
@@ -109,13 +112,19 @@ SPACE_TRACK_PASS=yourpassword
 
 ## Current Status
 
-### Phase 1 — C++ Integrator
+### Phase 1 — C++ Integrator ✓
 - [x] `integrator/integrator.h` — StateVector, constants, declarations
 - [x] `integrator/integrator.cpp` — RK4, 2-body + J2 EOM, propagate functions
 - [x] `integrator/bindings.cpp` — pybind11 module (`orbit_integrator`)
 - [x] `CMakeLists.txt` + `setup.py` — build system
 - [x] `tests/test_integrator.py` — 4 validation tests written
-- [ ] **Build and run tests** — `pip install -e .` then `pytest tests/` ← next step
+- [ ] **Build and run tests** — `pip install -e .` then `pytest tests/`
 
-### Phase 2+ — Not yet started
-Situational awareness, constraint solver, optimizer, agent layer, output composer.
+### Phase 2 — Situational Awareness ✓
+- [x] `awareness/tle_fetcher.py` — Space-Track auth, full LEO catalog pull, 24-hr disk cache
+- [x] `awareness/conjunction.py` — vectorised SGP4 (SatrecArray) vs RK4 mission orbit, threshold filter, TCA tracking
+- [x] `tests/test_conjunction.py` — conjunction checker unit tests
+- [ ] **Run tests** — `pytest tests/test_conjunction.py` ← next step
+
+### Phase 3+ — Not yet started
+Constraint solver, optimizer, agent layer, output composer.

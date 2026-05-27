@@ -72,13 +72,15 @@ def check_conjunctions(
         t_epoch = epoch + timedelta(seconds=step * dt)
         jd, fr  = _to_jday(t_epoch)
 
-        # Broadcast scalar Julian date/fraction across all N satellites so
-        # sgp4() can evaluate the entire catalog in a single vectorised call.
-        jd_arr = np.full(N, jd)
-        fr_arr = np.full(N, fr)
-        # e: (N,) error codes — nonzero means SGP4 failed for that object
-        # r: (N,3) ECI positions in km
-        e, r, _ = sats.sgp4(jd_arr, fr_arr)
+        # SatrecArray.sgp4 requires NumPy arrays (calls .astype internally).
+        # Wrapping in a length-1 array gives shape (N_sats, 1, 3) for r and
+        # (N_sats, 1) for e — the reshape calls below flatten the time dimension.
+        e, r, _ = sats.sgp4(np.array([jd]), np.array([fr]))
+
+        # Explicitly reshape to (N,) and (N, 3) — sgp4 may squeeze dimensions
+        # when N=1, producing shapes () and (3,) which break the norm/mask logic.
+        e = np.asarray(e).reshape(N)
+        r = np.asarray(r).reshape(N, 3)
 
         valid = (e == 0)  # mask out objects with SGP4 errors (decayed, bad TLE, etc.)
         r_m   = r * 1000.0  # km → meters to match mission_pos units
