@@ -15,7 +15,13 @@ import numpy as np
 import pytest
 
 from awareness.tle_fetcher import _parse, fetch_tles
-from awareness.conjunction import ConjunctionResult, check_conjunctions
+from awareness.conjunction import (
+    CatalogCache,
+    ConjunctionResult,
+    _compute_catalog_positions,
+    _filter_by_altitude,
+    check_conjunctions,
+)
 
 MU_EARTH = 3.986004418e14
 R_EARTH  = 6.3781e6
@@ -148,3 +154,65 @@ def test_check_conjunctions_empty_catalog():
 
     results = check_conjunctions(mission_state, epoch, 3600.0, catalog=[])
     assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — CatalogCache: SGP4 computed once for same epoch/duration/dt/altitude
+# ---------------------------------------------------------------------------
+def test_catalog_cache_hit():
+    a      = R_EARTH + 400e3      # ISS TLE is ~420 km; must be within ±25 km band
+    v_circ = np.sqrt(MU_EARTH / a)
+    epoch  = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Two different mission states at the same altitude — same cache key.
+    state1 = np.array([a, 0.0, 0.0, 0.0, 0.0, v_circ])
+    state2 = np.array([a, 0.0, 0.0, 0.0, v_circ * 0.7071, v_circ * 0.7071])
+
+    cache = CatalogCache()
+
+    with patch(
+        "awareness.conjunction._compute_catalog_positions",
+        wraps=_compute_catalog_positions,
+    ) as mock_fn:
+        check_conjunctions(state1, epoch, 3600.0, [ISS_TLE], dt=30.0, catalog_cache=cache)
+        check_conjunctions(state2, epoch, 3600.0, [ISS_TLE], dt=30.0, catalog_cache=cache)
+        # Same epoch / duration / dt / altitude → catalog positions computed once.
+        assert mock_fn.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — Altitude filter: TLE string parsing selects correct orbit shells
+# ---------------------------------------------------------------------------
+def test_altitude_filter():
+    def _make_tle(alt_km: float, norad_id: int, ecc: float = 0.0001) -> tuple:
+        """Construct a minimal TLE for a given circular-ish altitude."""
+        a         = R_EARTH + alt_km * 1e3
+        n_rev_day = np.sqrt(MU_EARTH / a ** 3) * 86400.0 / (2.0 * np.pi)
+        ecc_str   = f"{int(ecc * 1e7):07d}"
+        name  = f"TEST-{alt_km:.0f}KM"
+        line1 = (f"1 {norad_id:05d}U 24001A   24001.00000000  .00000000"
+                 f"  00000+0  00000+0 0  9990")
+        line2 = (f"2 {norad_id:05d}  97.0000   0.0000 {ecc_str}  90.0000"
+                 f" 270.0000 {n_rev_day:11.8f}    10")
+        return (name, line1, line2)
+
+    # Circular orbit at the target altitude — should pass.
+    tle_500 = _make_tle(500.0, 11001)
+
+    # Eccentric orbit: periapsis ~400 km, apoapsis ~650 km — crosses the band.
+    # sma = R_EARTH + 525 km, ecc = 125 km / sma  →  peri ≈ 400 km, apo ≈ 650 km
+    a_ecc   = R_EARTH + 525e3
+    ecc_val = 125e3 / a_ecc
+    tle_ecc = _make_tle(525.0, 11002, ecc=ecc_val)
+
+    # Circular orbit at 1000 km — too high, should be excluded.
+    tle_1000 = _make_tle(1000.0, 11003)
+
+    catalog     = [tle_500, tle_ecc, tle_1000]
+    target_sma  = R_EARTH + 500e3
+    filtered    = _filter_by_altitude(catalog, target_sma, band_m=100_000.0)
+    names       = [t[0] for t in filtered]
+
+    assert "TEST-500KM"  in names, "Circular orbit at target altitude should be included"
+    assert "TEST-525KM"  in names, "Eccentric orbit crossing the band should be included"
+    assert "TEST-1000KM" not in names, "Orbit at 1000 km should be excluded"

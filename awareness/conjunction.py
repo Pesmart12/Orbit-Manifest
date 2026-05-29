@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -7,17 +8,196 @@ import numpy as np
 from sgp4.api import Satrec, SatrecArray, jday
 
 # C++ RK4 integrator — propagates the *mission* orbit at high fidelity.
-# The catalog objects are propagated with SGP4 (see _download) because running
-# 20 k objects through RK4 every optimizer call would be prohibitively slow.
+# The catalog objects are propagated with SGP4 because running 20k objects
+# through RK4 every optimizer call would be prohibitively slow, and TLE mean
+# elements are defined relative to the SGP4 model — not osculating elements.
 import orbit_integrator as oi
+
+MU_EARTH = 3.986004418e14  # m³/s²
+R_EARTH  = 6.3781e6        # m
+
+# Warn (not error) when the cached position array exceeds this size.
+_WARN_BYTES = 3 * 1024 ** 3  # 3 GB
 
 
 @dataclass
 class ConjunctionResult:
-    norad_id: str          # NORAD catalog number as a string
-    name: str              # human-readable satellite name from the TLE header
-    min_separation_m: float              # closest approach distance in meters
-    time_of_closest_approach_s: float   # seconds after epoch when TCA occurs
+    norad_id: str                          # NORAD catalog number as a string
+    name: str                              # human-readable satellite name from the TLE header
+    min_separation_m: float               # closest approach distance in meters
+    time_of_closest_approach_s: float     # seconds after epoch when TCA occurs
+
+
+def _filter_by_altitude(
+    catalog: list[tuple[str, str, str]],
+    target_sma_m: float,
+    band_m: float = 50_000.0,
+) -> list[tuple[str, str, str]]:
+    """Keep only TLEs whose orbit intersects the altitude band around target_sma_m.
+
+    Uses TLE string parsing only — no SGP4 call needed. Reduces catalog size
+    before any expensive propagation so that _compute_catalog_positions works on
+    a smaller N.
+
+    TLE field positions used (0-indexed):
+        line2[26:33] — eccentricity (7 digits, implied leading "0.")
+        line2[52:63] — mean motion in rev/day (11 chars)
+    """
+    # lo/hi are semi-major axis values (meters from Earth's centre), not altitudes.
+    # Using SMA rather than altitude avoids having to add R_EARTH to every comparison.
+    lo = target_sma_m - band_m / 2.0
+    hi = target_sma_m + band_m / 2.0
+    filtered = []
+    for entry in catalog:
+        _, _, line2 = entry
+        try:
+            # Read mean motion (rev/day) and eccentricity directly from the TLE
+            # string — no SGP4 call needed.  These are the only two fields required
+            # to compute periapsis/apoapsis, and parsing is O(1) per object.
+            n_rev_day = float(line2[52:63])
+            # Eccentricity is stored as 7 digits with an implied leading "0." —
+            # e.g., "0001500" → 0.0001500.
+            ecc       = float("0." + line2[26:33])
+            # Kepler's third law: n² a³ = μ  →  a = (μ / n²)^(1/3)
+            n_rad_s   = n_rev_day * 2.0 * np.pi / 86400.0
+            a         = (MU_EARTH / n_rad_s ** 2) ** (1.0 / 3.0)
+            periapsis = a * (1.0 - ecc)
+            apoapsis  = a * (1.0 + ecc)
+            # Interval intersection: [periapsis, apoapsis] overlaps [lo, hi] iff
+            # periapsis < hi AND apoapsis > lo.  This correctly captures eccentric
+            # objects that pass through the mission shell even if their mean
+            # altitude is far from the target.
+            if periapsis < hi and apoapsis > lo:
+                filtered.append(entry)
+        except (ValueError, IndexError):
+            continue  # skip malformed TLEs silently
+    return filtered
+
+
+def _compute_catalog_positions(
+    sats: SatrecArray,
+    epoch: datetime,
+    n_steps: int,
+    dt: float,
+) -> np.ndarray:
+    """Propagate all catalog objects across every time step in a single SGP4 call.
+
+    Returns shape (T, N, 3) in meters, with np.inf at positions where SGP4
+    failed (decayed satellites, bad TLEs, etc.).
+
+    The key optimization over the previous loop-per-step design: SatrecArray.sgp4
+    accepts an array of T time points and returns (N, T, 3) in one call, replacing
+    T sequential Python → C extension round trips with one.
+    """
+    T = n_steps + 1
+
+    # Build arrays of Julian date integer and fractional parts for all T time steps.
+    # sgp4 splits the Julian date into (jd, fr) to avoid precision loss near midnight
+    # when a single float64 would have insufficient resolution (~8.6 ms at J2000).
+    # We still use a Python loop here because _to_jday calls sgp4.api.jday() which
+    # has no vectorised Python equivalent — the loop is O(T) trivial arithmetic and
+    # is not a meaningful bottleneck compared to the SGP4 propagation itself.
+    jd_arr = np.empty(T)
+    fr_arr = np.empty(T)
+    for i in range(T):
+        t = epoch + timedelta(seconds=i * dt)
+        jd_arr[i], fr_arr[i] = _to_jday(t)
+
+    # Single vectorized call across all N satellites and all T time steps.
+    # SatrecArray.sgp4(jd, fr) where jd/fr are length-T arrays returns:
+    #   e: (N, T)    — SGP4 error codes (0 = success)
+    #   r: (N, T, 3) — ECI positions in km
+    # This replaces the previous design of T individual sgp4() calls in a Python
+    # loop, eliminating T Python → C extension round trips per generation.
+    e, r, _ = sats.sgp4(jd_arr, fr_arr)
+
+    # SGP4 returns (N, T, 3) — satellite-major order.  Transpose to (T, N, 3) so
+    # the time axis is first, matching mission_pos shape (T, 3) for broadcasting.
+    catalog_pos = np.asarray(r, dtype=np.float64).transpose(1, 0, 2) * 1000.0  # km → m
+
+    # Mask failed SGP4 positions with inf so they can never satisfy threshold_m.
+    # valid is (N, T); valid.T is (T, N).  Boolean-indexing catalog_pos (T, N, 3)
+    # with a (T, N) mask selects whole (x,y,z) rows, so setting to inf kills all
+    # three coordinates of each bad position at once.
+    valid = np.asarray(e) == 0  # (N, T); non-zero codes mean decayed / bad TLE
+    catalog_pos[~valid.T] = np.inf
+
+    return catalog_pos
+
+
+class CatalogCache:
+    """In-memory cache of pre-computed catalog position arrays.
+
+    One instance should live for the lifetime of an optimization run. Because
+    epoch, duration, and dt are fixed across all candidate orbits in a run,
+    the catalog SGP4 propagation is done once and reused for every candidate.
+
+    Usage:
+        cache = CatalogCache()
+        # Pass to check_conjunctions in the optimizer loop:
+        results = check_conjunctions(..., catalog_cache=cache)
+    """
+
+    def __init__(self) -> None:
+        self._store: dict = {}
+
+    def get_or_compute(
+        self,
+        catalog: list[tuple[str, str, str]],
+        epoch: datetime,
+        duration_s: float,
+        dt: float,
+        target_sma_m: float,
+    ) -> tuple[np.ndarray, list[str], list[str]]:
+        """Return (catalog_pos (T,N,3) m, names, norad_ids) for the given parameters.
+
+        Altitude is rounded to the nearest km so candidate orbits at the same
+        shell share a cache entry even if their exact radii differ slightly.
+        """
+        # round(..., -3) rounds to the nearest 1000 m (1 km).  Candidate orbits
+        # at the same shell but slightly different radii (e.g. 6878.1 km vs
+        # 6878.4 km) share a single cache entry rather than computing separate
+        # arrays that are effectively identical for conjunction screening purposes.
+        key = (epoch.isoformat(), duration_s, dt, round(target_sma_m, -3))
+        if key not in self._store:
+            self._store[key] = self._compute(catalog, epoch, duration_s, dt, target_sma_m)
+        return self._store[key]
+
+    def _compute(
+        self,
+        catalog: list[tuple[str, str, str]],
+        epoch: datetime,
+        duration_s: float,
+        dt: float,
+        target_sma_m: float,
+    ) -> tuple[np.ndarray, list[str], list[str]]:
+        filtered = _filter_by_altitude(catalog, target_sma_m)
+        if not filtered:
+            return np.empty((0, 0, 3)), [], []
+
+        names       = [t[0] for t in filtered]
+        satrec_list = [Satrec.twoline2rv(t[1], t[2]) for t in filtered]
+        norad_ids   = [str(s.satnum) for s in satrec_list]
+        sats        = SatrecArray(satrec_list)
+
+        n_steps = int(duration_s / dt)
+        T, N    = n_steps + 1, len(filtered)
+
+        # T steps × N objects × 3 coords × 8 bytes (float64)
+        nbytes = T * N * 3 * 8
+        if nbytes > _WARN_BYTES:
+            # stacklevel=4 surfaces the warning at the check_conjunctions call
+            # site in user code rather than inside this private method chain.
+            warnings.warn(
+                f"Catalog position array is {nbytes / 1024 ** 3:.1f} GB "
+                f"({N} objects × {T} steps). Consider reducing duration_s "
+                f"or widening the altitude band.",
+                ResourceWarning,
+                stacklevel=4,
+            )
+
+        catalog_pos = _compute_catalog_positions(sats, epoch, n_steps, dt)
+        return catalog_pos, names, norad_ids
 
 
 def check_conjunctions(
@@ -27,17 +207,20 @@ def check_conjunctions(
     catalog: list[tuple[str, str, str]],
     dt: float = 30.0,
     threshold_m: float = 5000.0,
+    catalog_cache: CatalogCache | None = None,
 ) -> list[ConjunctionResult]:
     """
     Check mission orbit against TLE catalog for conjunctions.
 
     Args:
-        mission_state: shape (6,) ECI state [x,y,z,vx,vy,vz] in m / m/s
-        epoch:         UTC datetime corresponding to mission_state t=0
-        duration_s:    propagation window in seconds
-        catalog:       [(name, line1, line2), ...] from tle_fetcher
-        dt:            time step in seconds (30 s sufficient for LEO screening)
-        threshold_m:   conjunction distance threshold in meters
+        mission_state:  shape (6,) ECI state [x,y,z,vx,vy,vz] in m / m·s⁻¹
+        epoch:          UTC datetime corresponding to mission_state t=0
+        duration_s:     propagation window in seconds
+        catalog:        [(name, line1, line2), ...] from tle_fetcher
+        dt:             time step in seconds (30 s sufficient for LEO screening)
+        threshold_m:    conjunction distance threshold in meters
+        catalog_cache:  optional CatalogCache shared across calls; create one
+                        per optimizer run so catalog positions are computed once
 
     Returns:
         List of ConjunctionResult below threshold, sorted by min_separation_m.
@@ -45,67 +228,50 @@ def check_conjunctions(
     if not catalog:
         return []
 
-    # Ensure epoch is timezone-aware so timedelta arithmetic stays unambiguous.
     epoch = epoch.replace(tzinfo=timezone.utc) if epoch.tzinfo is None else epoch
 
-    names    = [t[0] for t in catalog]
-    # Parse every TLE into a Satrec object (SGP4 internal state).
-    satrecs  = [Satrec.twoline2rv(t[1], t[2]) for t in catalog]
-    norad_ids = [str(s.satnum) for s in satrecs]
-    # SatrecArray lets sgp4 propagate the entire catalog in one vectorised call
-    # instead of looping over individual Satrec objects — critical for 20 k objects.
-    sats     = SatrecArray(satrecs)
-    N        = len(satrecs)
+    # An ephemeral cache is created when none is provided so the function is
+    # correct in isolation, but callers in the optimizer loop should pass a
+    # shared CatalogCache instance to actually benefit from caching across calls.
+    cache        = catalog_cache if catalog_cache is not None else CatalogCache()
+    # For a circular orbit, norm(r_vec) equals the semi-major axis exactly.
+    # For a slightly elliptical candidate, it's the radius at the current true
+    # anomaly — close enough to SMA for the altitude pre-filter to be correct.
+    target_sma_m = float(np.linalg.norm(mission_state[:3]))
+    n_steps      = int(duration_s / dt)
 
-    n_steps = int(duration_s / dt)
+    catalog_pos, names, norad_ids = cache.get_or_compute(
+        catalog, epoch, duration_s, dt, target_sma_m
+    )
 
-    # Propagate the mission orbit once up front with the C++ RK4 integrator.
-    # Shape: (n_steps+1, 6) — we only need the position columns [:3].
-    mission_traj = oi.propagate_single(mission_state, dt, n_steps)
-    mission_pos  = np.asarray(mission_traj)[:, :3]  # (n_steps+1, 3) meters
+    N = len(names)
+    if N == 0:
+        return []
 
-    # Track the minimum separation and its time for every catalog object.
-    min_sep = np.full(N, np.inf)
-    tca     = np.zeros(N)
+    # Propagate mission orbit with C++ RK4; extract positions only (columns 0-2).
+    # Shape: (T, 3) meters.  Velocities are not needed for separation computation.
+    mission_pos = np.asarray(oi.propagate_single(mission_state, dt, n_steps))[:, :3]
 
-    for step in range(n_steps + 1):
-        t_epoch = epoch + timedelta(seconds=step * dt)
-        jd, fr  = _to_jday(t_epoch)
+    # Vectorized separation across all time steps and all catalog objects at once.
+    # mission_pos[:, None, :] inserts a size-1 axis at position 1, giving shape
+    # (T, 1, 3).  Subtracting from catalog_pos (T, N, 3) broadcasts to (T, N, 3).
+    # np.linalg.norm(..., axis=2) then reduces the xyz dimension → (T, N) distances.
+    diff = catalog_pos - mission_pos[:, None, :]
+    sep  = np.linalg.norm(diff, axis=2)  # (T, N)
 
-        # SatrecArray.sgp4 requires NumPy arrays (calls .astype internally).
-        # Wrapping in a length-1 array gives shape (N_sats, 1, 3) for r and
-        # (N_sats, 1) for e — the reshape calls below flatten the time dimension.
-        e, r, _ = sats.sgp4(np.array([jd]), np.array([fr]))
+    min_sep = sep.min(axis=0)     # (N,) — closest approach per satellite across all T steps
+    tca_idx = sep.argmin(axis=0)  # (N,) — index of the time step where min occurred
+    tca_s   = tca_idx * dt        # (N,) — convert step index to seconds after epoch
 
-        # Explicitly reshape to (N,) and (N, 3) — sgp4 may squeeze dimensions
-        # when N=1, producing shapes () and (3,) which break the norm/mask logic.
-        e = np.asarray(e).reshape(N)
-        r = np.asarray(r).reshape(N, 3)
-
-        valid = (e == 0)  # mask out objects with SGP4 errors (decayed, bad TLE, etc.)
-        r_m   = r * 1000.0  # km → meters to match mission_pos units
-
-        diff = r_m - mission_pos[step]       # (N, 3) displacement vectors
-        sep  = np.linalg.norm(diff, axis=1)  # (N,) scalar distances
-
-        # Invalidate failed SGP4 results so they never satisfy the threshold check.
-        sep[~valid] = np.inf
-
-        # Update min_sep and tca only where this step beat the previous minimum.
-        improved          = sep < min_sep
-        min_sep[improved] = sep[improved]
-        tca[improved]     = step * dt
-
-    # Collect only the objects that came within threshold and sort closest-first.
+    hits = np.where(min_sep < threshold_m)[0]
     results = [
         ConjunctionResult(
             norad_id=norad_ids[i],
             name=names[i],
             min_separation_m=float(min_sep[i]),
-            time_of_closest_approach_s=float(tca[i]),
+            time_of_closest_approach_s=float(tca_s[i]),
         )
-        for i in range(N)
-        if min_sep[i] < threshold_m
+        for i in hits
     ]
     results.sort(key=lambda r: r.min_separation_m)
     return results
