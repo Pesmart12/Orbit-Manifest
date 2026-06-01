@@ -275,17 +275,26 @@ orbit-manifest/
    - `custom(...)`
    - `OrbitalBounds.as_scipy_bounds()` → `[(lo, hi), ...]` ready for scipy
 10. [ ] Write `tests/test_solver.py` — unit test each goal constructor
+11. [x] `physics/pre_propagation.py` — `OrbitScreen` pre-propagation gate:
+    - Perigee clearance, apogee ceiling, window vs. period — O(1) Keplerian arithmetic, no integrator call
+    - Used in Phase 4 optimizer to reject degenerate candidates before batch propagation
+    - `physics/post_propagation.py` — `check_post_propagation` + `specific_energy` (deferred — see Future Experiments)
+    - 8 tests in `tests/test_physics_agreement.py` (all passing)
 
 ### Phase 4 — Optimizer ← NEXT
-11. Implement `optimizer/optimizer.py`:
+12. Implement `optimizer/optimizer.py`:
     - `keplerian_to_cartesian(params)` — convert 5-element Keplerian → 6-element ECI state
-    - `batch_fitness(population, cache, catalog, epoch, duration)` — batch evaluate N candidates
+    - `batch_fitness(population, cache, catalog, epoch, duration)` — batch evaluate N candidates; screen each with `check_pre_propagation` before propagation, assign penalty 1e10 on failure
     - `run_optimizer(orbital_bounds, catalog, epoch, duration, objective_fn)` — outer loop
-12. Wire `differential_evolution` with `workers=1`, `updating='deferred'`, `popsize=15`
-13. Wire `CatalogCache` — instantiate once, pass into fitness function
-14. Wire `propagate_batch_final` as the inner propagation loop
-15. Test on simple case: minimize SMA (lowest safe altitude) for a sun-synchronous orbit
-16. Add delta-v objective once simple case passes
+13. Wire `differential_evolution` with `workers=1`, `updating='deferred'`, `popsize=15`
+14. Wire `CatalogCache` — instantiate once, pass into fitness function
+15. Wire `propagate_batch_final` as the inner propagation loop
+16. Test on simple case: minimize SMA (lowest safe altitude) for a sun-synchronous orbit
+17. Add delta-v objective once simple case passes
+
+### Future Experiments (post-Phase 4)
+- **Post-propagation integrity experiment:** Wire `check_post_propagation` into the optimizer and study when/how often RK4 at dt=10s fails energy or momentum conservation thresholds across a 7-day mission. Use findings to calibrate threshold values and explore adaptive timestep retry (re-propagate failing candidates at dt/2 with 2× n_steps before hard-rejecting).
+- **Propagator comparison:** Benchmark RK4 accuracy vs. an alternative propagator using the post-propagation checks as the evaluation metric.
 
 ### Phase 5 — Agent Layer
 17. Define tool schemas for Claude API function calling
