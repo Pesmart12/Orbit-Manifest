@@ -10,3 +10,4 @@ orbit_manifest.egg-info/top_level.txt
 tests/test_conjunction.py
 tests/test_constraint_solver.py
 tests/test_integrator.py
+tests/test_physics_agreement.py
