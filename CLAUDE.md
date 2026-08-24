@@ -1,20 +1,28 @@
 # CLAUDE.md — Orbit Manifest
 
 ## What This Project Is
-A natural language orbital mission design agent. Users describe a mission goal in plain English; the system produces an optimized orbit with conjunction analysis against the live LEO satellite catalog. See PLANNING.md for full architecture.
+A natural language orbital mission design agent. Users describe a mission goal in plain English; the system produces an optimized orbit with conjunction analysis against the live LEO satellite catalog.
+
+**This file is the single source of truth for architecture, status, and roadmap.** README.md is the outward-facing description (what it does, how to install and run it) and deliberately tracks no status.
 
 ---
 
 ## Build Commands
 
+All Python runs through conda. Activate your environment first.
+
 ```bash
-# Install build dependencies (first time only)
+# Create environment (first time)
+conda env create -f environment.yml
+conda activate orbit-manifest
+
+# Install build dependencies (first time)
 pip install pybind11 numpy setuptools
 
-# Install Python dependencies
+# Install Python dependencies (includes sgp4, anthropic, matplotlib, python-dotenv)
 pip install -r requirements.txt
 
-# Build C++ integrator and install as Python module
+# Build C++ integrator and install as Python module — do this before anything else
 pip install -e .
 
 # Build C++ manually (alternative)
@@ -25,6 +33,13 @@ make -j$(nproc)   # Linux/Mac
 
 # Run tests
 pytest tests/
+# On Windows, pytest's faulthandler prints "Windows fatal exception: code 0xc06d007f"
+# from numpy's LAPACK and matplotlib. It is a *handled* delay-load exception, not a
+# crash — the suite still passes. Silence it with: pytest tests/ -p no:faulthandler
+
+# End-to-end run
+python run.py "7-day sun-synchronous Earth observation at 550 km" --quick   # fast pipeline check
+python run.py "7-day sun-synchronous Earth observation at 550 km"             # full run (~17 min)
 ```
 
 ---
@@ -37,17 +52,22 @@ orbit-manifest/
 │   ├── integrator.h      # StateVector type, constants, declarations
 │   ├── integrator.cpp    # RK4 + 2-body + J2 equations of motion
 │   └── bindings.cpp      # pybind11 numpy bindings
-├── tests/
-│   ├── test_integrator.py  # Validation: period, energy, J2 drift, batch (4 tests)
-│   └── test_conjunction.py # Conjunction checker unit tests (7 tests)
-├── agent/                # Claude API orchestration (not yet implemented)
+├── physics/              # Pre/post propagation physics agreement gate
+│   ├── pre_propagation.py
+│   └── post_propagation.py
 ├── solver/               # NL goal → orbital constraints
-│   └── constraint_solver.py  # OrbitalBounds + goal constructors — IMPLEMENTED
-├── optimizer/            # scipy optimization loop (not yet implemented)
+│   └── constraint_solver.py  # OrbitalBounds dataclass + goal constructors
 ├── awareness/            # TLE fetching + conjunction checks
 │   ├── tle_fetcher.py    # Space-Track login, catalog pull, 24-hr disk cache
 │   └── conjunction.py    # SGP4 catalog vs RK4 mission orbit, CatalogCache
-├── output/               # Mission plan composition + plots (not yet implemented)
+├── optimizer/            # scipy differential evolution loop
+│   └── optimizer.py      # keplerian_to_cartesian, run_optimizer, OptimizationResult
+├── agent/                # Claude API orchestration
+│   └── agent.py          # _parse_mission, _intent_to_bounds, MissionPlan, plan_mission
+├── output/               # Report formatting + ground-track plot
+│   └── composer.py       # format_report, plot_ground_track
+├── tests/                # One test file per module
+├── run.py                # End-to-end CLI entry point
 ├── CMakeLists.txt        # C++ build config
 ├── setup.py              # pybind11 Python extension build
 └── .env                  # API keys (not committed)
@@ -134,8 +154,6 @@ The original conjunction checker looped over T time steps in Python, calling `Sa
 
 ## Optimizer — Design Decisions
 
-The optimizer is Phase 4 (not yet implemented). Key decisions already settled:
-
 **Algorithm:** `scipy.optimize.differential_evolution`
 - Gradient-free — conjunction penalties create hard discontinuities that break gradient-based solvers (SLSQP, L-BFGS-B)
 - Population-based — maps directly onto `propagate_batch_final`; the population of ~75 candidates per generation is the batch
@@ -181,6 +199,8 @@ def batch_fitness(population):           # shape (N, 5) Keplerian params
 
 ## Current Status
 
+**76/76 tests passing.** Counts below are measured, not estimated — update them when they change.
+
 ### Phase 1 — C++ Integrator ✓ (4/4 tests passing)
 - [x] `integrator/integrator.h` — StateVector, constants, declarations
 - [x] `integrator/integrator.cpp` — RK4, 2-body + J2 EOM, propagate functions
@@ -193,7 +213,7 @@ def batch_fitness(population):           # shape (N, 5) Keplerian params
 - [x] `awareness/conjunction.py` — refactored with `CatalogCache`, altitude pre-filter, vectorized SGP4, fully vectorized numpy separation (no Python loop)
 - [x] `tests/test_conjunction.py` — 7 tests: TLE cache TTL, parse structure, separation geometry, pipeline smoke test, empty catalog, cache hit, altitude filter
 
-### Phase 3 — Constraint Solver ✓ (implemented, not fully tested)
+### Phase 3 — Constraint Solver ✓ (17/17 tests passing)
 - [x] `solver/constraint_solver.py` — `OrbitalBounds` dataclass + goal constructors:
   - `sun_synchronous(altitude_km)` — J2 nodal drift formula to find exact SSO inclination
   - `low_earth_orbit(alt_min, alt_max, inc_min, inc_max)`
@@ -201,9 +221,95 @@ def batch_fitness(population):           # shape (N, 5) Keplerian params
   - `iss_rendezvous()`
   - `custom(...)`
   - `OrbitalBounds.as_scipy_bounds()` → `[(lo, hi), ...]` for scipy optimizer
+- [x] `tests/test_constraint_solver.py` — 17 tests: bounds validation, SSO inclination vs. known altitudes and drift rate, per-goal-constructor bands, custom roundtrip
 
-### Phase 4 — Optimizer ← next
-Design settled (see above). Implement `optimizer/optimizer.py`.
+### Phase 3b — Physics Agreement Layer ✓ (15/15 tests passing) — **not wired in**
+- [x] `physics/pre_propagation.py` — `OrbitScreen.check_pre_propagation`: perigee floor, apogee ceiling, integration window vs. orbital period. O(1), no integrator call.
+- [x] `physics/post_propagation.py` — `check_post_propagation` + `specific_energy` (2-body + J2)
+- [x] `tests/test_pre_propagation.py` (6) + `tests/test_post_propagation.py` (9)
+- ⚠️ Nothing outside `physics/` and its own tests imports this module. See Roadmap.
 
-### Phase 5+ — Not yet started
-Agent layer, output composer.
+### Phase 4 — Optimizer ✓ (8/8 tests passing)
+- [x] `optimizer/optimizer.py` — `keplerian_to_cartesian`, `_mission_objective`, `run_optimizer`
+- [x] `tests/test_optimizer.py` — Keplerian conversion, objective scoring, DE with empty/distant catalog, progress callback
+
+### Phase 5 — Agent Layer ✓ (10/10 tests passing)
+- [x] `agent/__init__.py`
+- [x] `agent/agent.py` — `_parse_mission` (Claude API structured JSON), `_intent_to_bounds`, `MissionPlan`, `plan_mission`
+- [x] `tests/test_agent.py` — mocked Claude API: parse extraction, bounds mapping for all 5 orbit types, end-to-end pipeline, progress callback
+
+### Phase 6 — Output Composer ✓ (15/15 tests passing)
+- [x] `output/__init__.py`
+- [x] `output/composer.py` — `format_report`, `plot_ground_track`, `_eci_to_latlon`, `_gmst_rad`, `_split_at_wraps`
+- [x] `tests/test_composer.py` — report content/format (7 tests), GMST, lat/lon geometry, wrap-around splitting, figure output and file save (mocked integrator)
+
+---
+
+## Roadmap — Specified but Not Built
+
+None of the following exists in the pipeline. Do not describe any of it as implemented.
+
+### Optimizer objectives
+`_mission_objective` scores **terminal eccentricity only**, and its docstring contradicts
+itself (claims energy-deviation, computes eccentricity). For a sun-synchronous run with
+`ecc_max=0.001` the search is close to degenerate. Intended objectives:
+- Delta-v minimization (launch → operational orbit)
+- Coverage maximization
+- Time-to-orbit minimization
+
+### Output composer
+`format_report` emits elements, one safety boolean, and optimizer stats. Intended:
+- **Launch window** — RAAN targeting from a launch site (needs a launch-site coordinate table, ~10 sites)
+- **Delta-v budget**
+- **Conjunction detail** — `ConjunctionResult` already carries NORAD ID, name, min separation
+  and TCA, but `OptimizationResult` keeps only `safe: bool`, so all of it is discarded.
+  Reporting `catalog_size` (full catalog) next to the verdict also overstates what was
+  screened — only the altitude-filtered subset is ever checked.
+- **Claude narrative summary** in plain English
+
+### Constraint solver
+- Repeat-groundtrack goals ("pass over the equator N times in D days") → period + RAAN constraint
+- Coverage requirement parsing
+
+### Integrator physics
+- Atmospheric drag (exponential density model; would need NOAA F10.7 / Kp indices)
+- Lunar/solar perturbations (n-body)
+- Adaptive step size (RK45)
+
+### Wiring the physics agreement layer
+`physics/` is written and tested but imported by nothing.
+- Wire `OrbitScreen.check_pre_propagation` into the optimizer's `batch_fitness` as a
+  pre-propagation reject, so degenerate candidates never reach the OpenMP kernel
+- **Post-propagation integrity experiment:** run `check_post_propagation` across a 7-day
+  mission to find where RK4 at dt=10 s violates energy/momentum thresholds; use the results
+  to calibrate the tolerances. Expect failures to cluster at high eccentricity and long
+  horizons — circular orbits drift <1 J/kg over 10 orbits, well inside the 10 J/kg default.
+- **Adaptive-timestep retry:** on an energy or momentum failure, re-propagate at `dt/2` with
+  2× `n_steps` (same total time). Cap at two halvings (dt → dt/2 → dt/4), then hard-fail.
+  A velocity-plausibility failure is a bad *initial* state, not a numerics problem — hard
+  reject it with no retry. Logging which check fired, and at what altitude/eccentricity,
+  gives the map needed to calibrate the thresholds.
+
+---
+
+## Decisions Recorded
+
+Deliberate choices that earlier drafts described differently. Don't "fix" the code back
+toward the older design without revisiting these.
+
+- **The agent is a single structured-output call, not a tool-using orchestrator.**
+  `_parse_mission` makes one `messages.create` call with `output_config.format` and returns
+  an intent dict. An earlier design gave Claude five tools (`solve_constraints`,
+  `optimize_orbit`, `check_conjunctions`, `propagate_orbit`, `compose_output`) plus an
+  interactive clarification flow for underspecified goals. Neither was built. The pipeline
+  downstream of parsing is fully deterministic and gains nothing from model-driven
+  orchestration.
+- **`vectorized=True` is what makes batching work**, not `workers=1`. scipy 1.17 overrides
+  `vectorized` whenever `workers != 1`, so `workers=1` is a requirement of the vectorized
+  contract — not merely a way to avoid fighting OpenMP. `batch_fitness` therefore receives
+  `(n_params, S)` and transposes; the population is `popsize × 5`.
+- **No PINN surrogate for the integrator.** Investigated and dropped; the full reasoning is
+  in Architecture Rules above. A design doc for the experiment (`EXPERIMENT_PINN.md`) was
+  removed in the same pass as `PLANNING.md` — recoverable from git history if the question
+  ever reopens. The adaptive-RK4 work it proposed was not PINN-specific and survives in the
+  Roadmap above.

@@ -2,26 +2,26 @@
 
 **Natural language mission design for orbital mechanics.**
 
-Describe what you want your satellite to do. Orbit Manifest designs an orbit that achieves it — optimized for your objectives and validated against the live LEO satellite catalog.
+Describe what you want your satellite to do. Orbit Manifest designs an orbit that achieves it — optimized against your objectives and validated against the live LEO satellite catalog.
 
 ```
-"Design a sun-synchronous orbit passing over the equator 3 times in 5 days,
- minimizing delta-v, with no conjunctions with active satellites."
+python run.py "7-day sun-synchronous Earth observation at 550 km"
 ```
 
-→ Orbital elements. Ground track. Launch window. Delta-v budget. Conjunction report.
+→ Optimal orbital elements. Conjunction safety report. Ground-track plot.
 
 ---
 
 ## What It Does
 
-Traditional mission design tools (GMAT, STK) require you to already know your orbital elements. Orbit Manifest works the other way: you describe the mission goal, and the system figures out the orbit.
+Traditional mission design tools (GMAT, STK) require you to already know your orbital elements. Orbit Manifest works the other way: you describe the mission goal in plain English, and the system figures out the orbit.
 
 **Example queries:**
 
-- *"Design an orbit that passes over Lagos every 12 hours for 30 days"*
-- *"Find the most fuel-efficient LEO orbit with equatorial ground coverage and no debris conjunctions"*
-- *"Sun-synchronous orbit for Earth observation, 500km altitude, 3 revisits per day over Europe"*
+- *"Sun-synchronous Earth observation at 550 km, 7 days"*
+- *"ISS rendezvous mission, 3-day crew rotation"*
+- *"Polar ice survey at 600 km, 5 days"*
+- *"LEO communications orbit, 500–700 km, mid-inclination"*
 
 The system handles the astrodynamics. You handle the mission.
 
@@ -33,44 +33,45 @@ The system handles the astrodynamics. You handle the mission.
 Natural Language Input
         │
         ▼
-  Claude API Agent          ← parses goals, handles ambiguity, composes output
+  Claude API (claude-opus-4-8)   ← extracts orbit type and parameters
         │
         ▼
-  Constraint Solver         ← maps mission goals to orbital mechanics constraints
+  Constraint Solver              ← maps mission goal to OrbitalBounds
         │
         ▼
-  Orbital Optimizer         ← scipy outer loop over candidate orbits
-        ├──► C++ RK4 Integrator (pybind11)     ← fast physics propagation
-        └──► Situational Awareness Layer        ← conjunction checks vs live TLE catalog
+  Differential Evolution         ← scipy optimizer over 5 Keplerian elements
+        ├──► C++ RK4 Integrator (pybind11)    ← fast 2-body + J2 propagation
+        └──► Conjunction Checker              ← vectorized SGP4 vs live TLE catalog
         │
         ▼
-  Mission Plan Output       ← elements, ground track, launch window, delta-v, conjunction report
+  Output Composer                ← text report + ground-track PNG
 ```
 
 ### Components
 
 | Component | Technology | Role |
 |---|---|---|
-| Agent | Claude API (claude-sonnet-4) | NL parsing, orchestration, output |
-| Constraint Solver | Python | Mission goal → orbital constraints |
-| Optimizer | scipy | Multi-objective orbit optimization |
-| Integrator | C++ / pybind11 | RK4 2-body + J2 propagation |
-| Situational Awareness | python-sgp4 | Conjunction analysis vs live catalog |
-| Data source | Space-Track.org | Live TLE catalog (~20k objects) |
+| Agent | Claude API (`claude-opus-4-8`) | NL parsing → structured orbit intent |
+| Constraint Solver | Python | Mission goal → `OrbitalBounds` |
+| Optimizer | scipy `differential_evolution` | Global search over Keplerian elements |
+| Integrator | C++17 / pybind11 | RK4 2-body + J2 propagation |
+| Conjunction Checker | python-sgp4, numpy | Vectorized catalog vs mission orbit |
+| TLE Catalog | Space-Track.org | Live LEO catalog (~20 k objects, 24-hr cache) |
+| Output | matplotlib | Ground-track plot + formatted text report |
 
 ---
 
 ## Physics
 
-The integrator implements:
+The C++ integrator implements:
 
 - **2-body gravitational model** — Newtonian point-mass gravity
-- **J2 perturbation** — Earth oblateness; required for accurate sun-synchronous orbit nodal precession
-- **RK4 fixed-step integration** — 4th order Runge-Kutta
+- **J2 perturbation** — Earth oblateness; required for accurate sun-synchronous nodal precession
+- **RK4 fixed-step integration** — 4th-order Runge-Kutta
 
-Written in C++, exposed to Python via pybind11. The optimizer calls it thousands of times per run — performance is non-negotiable.
+The TLE catalog is propagated with **SGP4** (python-sgp4) — the correct model for TLE mean elements. The mission orbit uses RK4 on osculating elements. The two are never mixed.
 
-Planned extensions: atmospheric drag, n-body (lunar/solar), adaptive step size (RK45).
+Conjunction checking is fully vectorized: a single `SatrecArray.sgp4()` call produces a `(T, N, 3)` position array; separation is computed with one numpy broadcast, no Python loop over time steps. Performance: ~2 s/generation vs ~37 s before refactoring.
 
 ---
 
@@ -78,11 +79,11 @@ Planned extensions: atmospheric drag, n-body (lunar/solar), adaptive step size (
 
 ### Prerequisites
 
-- Python 3.10+
-- C++17 compiler (GCC 11+ or Clang 14+)
+- [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda
+- C++17 compiler (GCC 11+, Clang 14+, or MSVC 2022)
 - CMake 3.20+
-- Anthropic API key
-- Space-Track.org account (free)
+- [Anthropic API key](https://console.anthropic.com) (`sk-ant-...`)
+- [Space-Track.org](https://www.space-track.org) account (free)
 
 ### Installation
 
@@ -90,83 +91,92 @@ Planned extensions: atmospheric drag, n-body (lunar/solar), adaptive step size (
 git clone https://github.com/yourusername/orbit-manifest
 cd orbit-manifest
 
-# Python dependencies
+# Create and activate conda environment
+conda env create -f environment.yml
+conda activate orbit-manifest
+
+# Install pip-only packages
 pip install -r requirements.txt
 
-# Build C++ integrator and install as Python module
+# Build the C++ integrator (must come last)
 pip install -e .
-
-# Configure credentials
-cp .env.example .env
-# Edit .env with your ANTHROPIC_API_KEY and Space-Track credentials
 ```
 
-### Build C++ integrator manually
+### Configure credentials
 
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+Create a `.env` file in the project root:
+
 ```
+ANTHROPIC_API_KEY=sk-ant-...
+SPACE_TRACK_USER=your@email.com
+SPACE_TRACK_PASS=yourpassword
+```
+
+No quotes, no spaces around `=`.
 
 ### Run
 
 ```bash
-python -m agent.agent "Design a sun-synchronous orbit passing over the equator 3 times in 5 days, minimizing delta-v, no conjunctions"
+# Quick pipeline check (~30 s, low-fidelity)
+python run.py "7-day sun-synchronous Earth observation at 550 km" --quick
+
+# Full production run (~17 min on 8-core machine)
+python run.py "7-day sun-synchronous Earth observation at 550 km"
+
+# Other options
+python run.py "ISS rendezvous, 3 days" --output results/ --seed 42
+```
+
+Output lands in `results/mission_report.txt` and `results/ground_track.png`.
+
+### Run tests
+
+```bash
+pytest tests/
 ```
 
 ---
 
-## Output
-
-Orbit Manifest returns a full mission plan:
+## Sample Output
 
 ```
-═══════════════════════════════════════
-  ORBIT MANIFEST — MISSION PLAN
-═══════════════════════════════════════
+══════════════════════════════════════════════════════════════
+                 ORBIT MANIFEST — Mission Report
+══════════════════════════════════════════════════════════════
 
-Orbital Elements
-  Semi-major axis (a):    6878.1 km
-  Eccentricity (e):       0.0001
-  Inclination (i):        97.4°
-  RAAN (Ω):               312.7°
-  Arg. of perigee (ω):    0.0°
+  Mission:    7-day sun-synchronous Earth observation at 550 km
+  Orbit type: Sun Synchronous
+  Generated:  2025-06-19 14:32:07 UTC
+  Rationale:  SSO at 550 km provides consistent solar lighting for imaging
 
-Mission Performance
-  Orbital period:         90.5 min
-  Equatorial passes:      3 in 5 days ✓
-  Orbit type:             Sun-synchronous ✓
+──────────────────────────────────────────────────────────────
+  OPTIMAL ORBITAL ELEMENTS
+──────────────────────────────────────────────────────────────
+  Semi-major axis:      6928.10 km
+  Altitude (peri):       549.8 km
+  Altitude (apo):        550.2 km
+  Inclination:            97.6412 °
+  Eccentricity:         0.000061
+  Period:                97.4 min
+  RAAN:                  135.22 °
+  Arg. of perigee:        22.07 °
 
-Delta-V Budget
-  Launch to operational:  ~1.8 km/s (from Vandenberg)
-  Station-keeping (1yr):  ~10 m/s
+──────────────────────────────────────────────────────────────
+  CONJUNCTION SAFETY
+──────────────────────────────────────────────────────────────
+  Catalog size:          24,857 objects
+  Safety status:         SAFE  ✓
 
-Conjunction Report
-  Objects screened:       22,847
-  Close approaches (< 5km): 0 ✓
-  Minimum separation:     12.3 km (NOAA-20, T+2.3 days)
-
-Launch Window
-  Next opportunity:       2025-03-15 06:42 UTC
-  RAAN alignment from:    Vandenberg SFB (34.7°N, 120.6°W)
+──────────────────────────────────────────────────────────────
+  OPTIMIZER STATISTICS
+──────────────────────────────────────────────────────────────
+  Converged:                    Yes
+  Objective (ecc):         0.000061
+  Generations:                  312
+  Conjunction calls:         23,400
+  Wall-clock time:            982.4 s
+  Message:           Optimization terminated successfully.
 ```
-
-Ground track and trajectory plots saved to `output/`.
-
----
-
-## Project Status
-
-| Component | Status |
-|---|---|
-| C++ RK4 Integrator | Implemented |
-| pybind11 bindings | Implemented |
-| Situational Awareness | In progress |
-| Constraint Solver | Planned |
-| Orbital Optimizer | Planned |
-| Claude API Agent | Planned |
-| Output Composer | Planned |
 
 ---
 
@@ -177,12 +187,11 @@ Ground track and trajectory plots saved to `output/`.
 | Cost | Free | $$$$ | Free / open source |
 | Input | Orbital elements | Orbital elements | Natural language |
 | Learning curve | High | High | Low |
-| Mission design | Yes | Yes | Yes |
 | Conjunction analysis | Yes | Yes | Yes |
-| Agentic / NL interface | No | No | Yes |
+| NL interface | No | No | Yes |
 | Target users | Experts | Enterprise | Small teams, universities |
 
-Orbit Manifest is not trying to replace GMAT or STK for professional missions with large teams. It's trying to make serious orbital mission design accessible to the teams that currently can't use those tools.
+Orbit Manifest is not trying to replace GMAT or STK for professional missions. It's trying to make serious orbital mission design accessible to teams that currently can't use those tools.
 
 ---
 
