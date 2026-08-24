@@ -68,8 +68,19 @@ def _eci_to_latlon(
 
 def _sample_trajectory(
     state0: np.ndarray, dt: float, total_steps: int, n_samples: int
-) -> np.ndarray:
-    """Return an (n_samples+1, 6) array sampling the orbit trajectory.
+) -> tuple[np.ndarray, float]:
+    """Sample the trajectory at uniform intervals spanning the whole mission.
+
+    Returns (states, sample_dt): an (n+1, 6) state array and the exact wall-clock
+    spacing between consecutive samples, in seconds.
+
+    Each sample advances a whole number of integrator steps, so the true spacing
+    is `chunk * dt` — not `duration_s / n_samples`, which is only equal when
+    n_samples divides total_steps exactly. Returning the real value is what keeps
+    the caller's Earth-rotation correction in step with the propagation.
+
+    `n_samples` is a target, not a guarantee: the count is adjusted so the samples
+    span the full mission instead of stopping short of it.
 
     Calls the C++ integrator in chunks so the full propagation is shared
     with the optimizer's integrator rather than reimplemented here.
@@ -78,13 +89,14 @@ def _sample_trajectory(
         raise ImportError(
             "orbit_integrator C++ module not found. Build it first with: pip install -e ."
         )
-    chunk = max(1, total_steps // n_samples)
+    chunk = max(1, round(total_steps / n_samples))
+    n_actual = max(1, math.ceil(total_steps / chunk))
     states = [state0.copy()]
     current = state0.copy()
-    for _ in range(n_samples):
+    for _ in range(n_actual):
         current = np.asarray(orbit_integrator.propagate_single_final(current, dt, chunk))
         states.append(current.copy())
-    return np.array(states)
+    return np.array(states), chunk * dt
 
 
 def _split_at_wraps(
@@ -198,10 +210,11 @@ def plot_ground_track(
     duration_s = plan.intent["duration_days"] * 86400.0
     total_steps = max(1, int(duration_s / dt))
 
-    # Propagate the best orbit
-    states = _sample_trajectory(plan.result.state, dt, total_steps, n_samples)
+    # Propagate the best orbit. Take sample_dt from the propagation itself —
+    # deriving it as duration_s / n_samples disagrees with the whole number of
+    # integrator steps actually taken per sample, which skews every longitude.
+    states, sample_dt = _sample_trajectory(plan.result.state, dt, total_steps, n_samples)
     positions = states[:, :3]                         # (N, 3) ECI metres
-    sample_dt = duration_s / n_samples                # effective dt between samples
 
     lat, lon = _eci_to_latlon(positions, epoch, sample_dt)
     segments = _split_at_wraps(lon, lat)

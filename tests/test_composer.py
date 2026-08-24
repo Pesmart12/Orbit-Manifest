@@ -19,6 +19,7 @@ from optimizer.optimizer import OptimizationResult
 from output.composer import (
     _eci_to_latlon,
     _gmst_rad,
+    _sample_trajectory,
     _split_at_wraps,
     format_report,
     plot_ground_track,
@@ -193,6 +194,50 @@ def test_split_at_wraps_one_wrap():
     assert len(segs) == 2
     assert len(segs[0][0]) == 2
     assert len(segs[1][0]) == 2
+
+
+# ---------------------------------------------------------------------------
+# _sample_trajectory — reported spacing must match the propagation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "days,dt,n_samples",
+    [(1.0, 60.0, 500), (3.0, 60.0, 500), (7.0, 60.0, 500), (1.0, 70.0, 500), (0.25, 60.0, 40)],
+)
+def test_sample_trajectory_dt_matches_propagation(days, dt, n_samples):
+    """sample_dt must equal the wall-clock time each sample actually advances.
+
+    Regression: sample_dt was derived as duration_s / n_samples while the
+    integrator advanced `total_steps // n_samples` whole steps per sample. The
+    two disagree whenever n_samples does not divide total_steps — a 7% longitude
+    error over 3 days and 30% over 1 day, plus a track that stopped short of the
+    end of the mission.
+    """
+    duration_s = days * 86400.0
+    total_steps = max(1, int(duration_s / dt))
+    recorded: list[int] = []
+
+    def fake_final(state, dt_, n_steps):
+        recorded.append(n_steps)
+        return np.asarray(state, dtype=float)
+
+    with patch("output.composer.orbit_integrator") as mock_oi:
+        mock_oi.propagate_single_final.side_effect = fake_final
+        state0 = np.array([_SMA, 0.0, 0.0, 0.0, 7600.0, 0.0])
+        states, sample_dt = _sample_trajectory(state0, dt, total_steps, n_samples)
+
+    # Uniform spacing — _eci_to_latlon assumes a single dt between all samples
+    assert len(set(recorded)) == 1, "chunks must all be the same size"
+    assert sample_dt == pytest.approx(recorded[0] * dt)
+
+    # The track spans the whole propagation horizon, overshooting by under one sample
+    propagated = len(recorded) * recorded[0]
+    assert propagated >= total_steps, "track stops short of the mission end"
+    assert propagated - total_steps < recorded[0]
+
+    # One row per sample, plus the initial state
+    assert states.shape == (len(recorded) + 1, 6)
 
 
 # ---------------------------------------------------------------------------
