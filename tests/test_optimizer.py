@@ -137,7 +137,10 @@ def test_run_optimizer_empty_catalog():
     result = run_optimizer(
         bounds=bounds,
         epoch=EPOCH,
-        duration_s=3600.0,    # 1-hour mission — fast for testing
+        # Must exceed one orbital period (~5690 s at 510 km): the pre-propagation
+        # screen rejects windows shorter than a revolution, since conjunction
+        # screening would then cover only part of the orbit.
+        duration_s=7200.0,
         catalog=[],           # empty catalog → no conjunctions possible
         dt=60.0,
         popsize=5,            # tiny population for speed
@@ -191,7 +194,7 @@ def test_run_optimizer_distant_catalog_object():
     result = run_optimizer(
         bounds=bounds,
         epoch=EPOCH,
-        duration_s=3600.0,
+        duration_s=7200.0,   # > one orbital period — see the screen note above
         catalog=catalog,
         dt=60.0,
         popsize=5,
@@ -220,7 +223,7 @@ def test_run_optimizer_progress_callback():
     run_optimizer(
         bounds=bounds,
         epoch=EPOCH,
-        duration_s=1800.0,
+        duration_s=7200.0,   # > one orbital period — see the screen note above
         catalog=[],
         dt=60.0,
         popsize=4,
@@ -232,3 +235,64 @@ def test_run_optimizer_progress_callback():
     assert len(calls) > 0, "progress_callback should have been called at least once"
     gens = [c[0] for c in calls]
     assert gens == sorted(gens), "Generation numbers should be non-decreasing"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: the pre-propagation screen is actually wired into the fitness loop
+# ---------------------------------------------------------------------------
+def test_pre_propagation_screen_rejects_short_window():
+    """A mission shorter than one orbit must be screened out, not propagated.
+
+    Regression: physics/ was implemented and tested but imported by nothing, so
+    degenerate candidates reached the integrator and were scored on a final
+    state that had not completed a revolution — conjunction screening covering
+    only part of the orbit.
+    """
+    bounds = OrbitalBounds(
+        sma_min=R_EARTH + 490e3,
+        sma_max=R_EARTH + 510e3,
+        inc_min=np.radians(97.0),
+        inc_max=np.radians(98.0),
+    )
+
+    result = run_optimizer(
+        bounds=bounds,
+        epoch=EPOCH,
+        duration_s=1800.0,   # ~32 min, well under the ~95 min period
+        catalog=[],
+        dt=60.0,
+        popsize=4,
+        maxiter=3,
+        seed=0,
+    )
+
+    assert result.screened_out > 0, "screen did not reject any sub-period candidate"
+    assert result.conjunctions_checked == 0, (
+        "screened candidates must not reach the conjunction check"
+    )
+    assert result.objective >= 1e10, "a fully screened population has no valid score"
+
+
+def test_pre_propagation_screen_passes_valid_orbits():
+    """A well-formed mission must survive the screen untouched."""
+    bounds = OrbitalBounds(
+        sma_min=R_EARTH + 490e3,
+        sma_max=R_EARTH + 510e3,
+        inc_min=np.radians(97.0),
+        inc_max=np.radians(98.0),
+        ecc_max=0.005,
+    )
+
+    result = run_optimizer(
+        bounds=bounds,
+        epoch=EPOCH,
+        duration_s=7200.0,   # > one orbital period
+        catalog=[],
+        dt=60.0,
+        popsize=4,
+        maxiter=3,
+        seed=0,
+    )
+
+    assert result.screened_out == 0, "well-formed candidates should not be screened out"
+    assert result.conjunctions_checked > 0

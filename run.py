@@ -86,66 +86,61 @@ def main() -> int:
         return 1
     print(f"  {len(catalog):,} TLE objects loaded.")
 
-    # ── Step 2: parse mission description with Claude ─────────────────────
+    # ── Steps 2 & 3: parse with Claude, then optimize ─────────────────────
     print("━" * 62)
     print(f'  Mission: "{args.mission}"')
     print("  Calling Claude to extract mission parameters …")
 
-    from agent.agent import _intent_to_bounds, _parse_mission, MissionPlan, plan_mission
-    from optimizer.optimizer import run_optimizer
+    from agent.agent import plan_mission
 
-    try:
-        intent = _parse_mission(args.mission)
-    except Exception as exc:
-        print(f"\n  ERROR calling Claude API: {exc}")
-        return 1
+    epoch  = datetime.now(timezone.utc)
+    t_opt  = time.perf_counter()
+    parsed = False
 
-    orbit_label = intent["orbit_type"].replace("_", " ").title()
-    print(f"  Orbit type:  {orbit_label}")
-    print(f"  Duration:    {intent['duration_days']} days")
-    print(f"  Rationale:   {intent.get('rationale', '')}")
+    def show_intent(intent: dict) -> None:
+        """Report what Claude understood, then open the optimizer section.
 
-    bounds = _intent_to_bounds(intent)
-    epoch = datetime.now(timezone.utc)
-    duration_s = intent["duration_days"] * 86400.0
-
-    # ── Step 3: optimizer ─────────────────────────────────────────────────
-    print("━" * 62)
-    print(f"  Optimizing orbit  [popsize={popsize}, maxiter={maxiter}]")
-    if args.quick:
-        print("  (--quick mode — low-fidelity run for pipeline verification)")
-    print()
-
-    t_opt = time.perf_counter()
+        plan_mission calls this between parsing and optimizing — the only moment
+        where the intent is known but the long run has not started, so the user
+        sees what was parsed before the CLI goes quiet for several minutes.
+        """
+        nonlocal parsed, t_opt
+        parsed = True
+        print(f"  Orbit type:  {intent['orbit_type'].replace('_', ' ').title()}")
+        print(f"  Duration:    {intent['duration_days']} days")
+        print(f"  Rationale:   {intent.get('rationale', '')}")
+        print("━" * 62)
+        print(f"  Optimizing orbit  [popsize={popsize}, maxiter={maxiter}]")
+        if args.quick:
+            print("  (--quick mode — low-fidelity run for pipeline verification)")
+        print()
+        t_opt = time.perf_counter()   # start the clock at the optimizer, not the API call
 
     def cb(gen: int, best: float) -> None:
         _progress_bar(gen, best, t_opt, maxiter)
 
     try:
-        result = run_optimizer(
-            bounds=bounds,
-            epoch=epoch,
-            duration_s=duration_s,
+        plan = plan_mission(
+            args.mission,
             catalog=catalog,
+            epoch=epoch,
             dt=args.dt,
             popsize=popsize,
             maxiter=maxiter,
             seed=args.seed,
             progress_callback=cb,
+            on_intent=show_intent,
         )
     except Exception as exc:
+        # show_intent fires between the two halves, so whether it ran tells us
+        # which one failed.
+        if not parsed:
+            print(f"\n  ERROR calling Claude API: {exc}")
+            return 1
         print(f"\n  ERROR during optimization: {exc}")
         raise
 
     print()  # newline after progress bar
-
-    plan = MissionPlan(
-        description=args.mission,
-        intent=intent,
-        bounds=bounds,
-        result=result,
-        catalog_size=len(catalog),
-    )
 
     # ── Step 4: text report ────────────────────────────────────────────────
     print("━" * 62)

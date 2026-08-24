@@ -22,6 +22,7 @@ from scipy.optimize import differential_evolution
 
 import orbit_integrator as oi
 from awareness.conjunction import CatalogCache, check_conjunctions
+from physics.pre_propagation import OrbitScreen
 from solver.constraint_solver import OrbitalBounds
 
 MU_EARTH = 3.986004418e14  # m³/s²
@@ -123,6 +124,7 @@ class OptimizationResult:
     elapsed_s: float              # wall-clock time
     message: str = ""
     safe: bool = True             # False if best candidate still has conjunctions
+    screened_out: int = 0         # candidates rejected by the pre-propagation screen
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +175,14 @@ def run_optimizer(
     # and reused for every conjunction call.
     catalog_cache = CatalogCache()
 
-    stats = {"generations": 0, "conjunction_calls": 0}
+    # One screen for the entire run — stateless, but built once rather than per
+    # generation. With bounds from the constraint solver's goal constructors this
+    # normally rejects nothing; it earns its place on custom() bounds and short
+    # missions, where a degenerate candidate would otherwise be propagated and
+    # scored on a final state that means nothing.
+    screen = OrbitScreen()
+
+    stats = {"generations": 0, "conjunction_calls": 0, "screened_out": 0}
     t0 = time.perf_counter()
 
     def batch_fitness(population: np.ndarray) -> np.ndarray:
@@ -185,23 +194,37 @@ def run_optimizer(
         N = len(population)
         scores = np.full(N, 1e10)
 
-        # Convert Keplerian → ECI for all N candidates at once
-        states = keplerian_to_cartesian(population)   # (N, 6)
+        # Pre-propagation screen — O(1) Keplerian arithmetic per candidate, no
+        # integrator call. Degenerate orbits (perigee inside the atmosphere,
+        # apogee out of the LEO shell, mission shorter than one orbit) never
+        # reach the OpenMP kernel or the conjunction check.
+        keep = np.fromiter(
+            (screen.check_pre_propagation(*row, n_steps=n_steps, dt=dt)[0]
+             for row in population),
+            dtype=bool,
+            count=N,
+        )
+        stats["screened_out"] += int((~keep).sum())
+        survivors = np.flatnonzero(keep)
 
-        # Batch propagate — OpenMP inside the C++ module
-        finals = np.asarray(oi.propagate_batch_final(states, dt, n_steps))  # (N, 6)
+        if survivors.size:
+            # Convert Keplerian → ECI for the survivors, then batch propagate
+            # them together — OpenMP inside the C++ module.
+            states = keplerian_to_cartesian(population[survivors])   # (S, 6)
+            finals = np.asarray(oi.propagate_batch_final(states, dt, n_steps))
 
-        for i in range(N):
-            stats["conjunction_calls"] += 1
-            hits = check_conjunctions(
-                states[i], epoch, duration_s, catalog,
-                dt=dt, threshold_m=threshold_m,
-                catalog_cache=catalog_cache,
-            )
-            if hits:
-                # Hard rejection — unsafe orbit
-                continue
-            scores[i] = _mission_objective(finals[i])
+            # j indexes the survivor subset; i is the candidate's slot in scores.
+            for j, i in enumerate(survivors):
+                stats["conjunction_calls"] += 1
+                hits = check_conjunctions(
+                    states[j], epoch, duration_s, catalog,
+                    dt=dt, threshold_m=threshold_m,
+                    catalog_cache=catalog_cache,
+                )
+                if hits:
+                    # Hard rejection — unsafe orbit
+                    continue
+                scores[i] = _mission_objective(finals[j])
 
         stats["generations"] += 1
         if progress_callback is not None:
@@ -247,4 +270,5 @@ def run_optimizer(
         elapsed_s=elapsed,
         message=result.message,
         safe=len(final_hits) == 0,
+        screened_out=stats["screened_out"],
     )

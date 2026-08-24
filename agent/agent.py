@@ -167,6 +167,7 @@ def plan_mission(
     maxiter: int = 500,
     seed: int | None = None,
     progress_callback: Callable[[int, float], None] | None = None,
+    on_intent: Callable[[dict], None] | None = None,
 ) -> MissionPlan:
     """Parse a NL mission description and find the optimal safe orbit.
 
@@ -179,6 +180,11 @@ def plan_mission(
         maxiter:           Maximum optimizer generations.
         seed:              RNG seed for reproducibility.
         progress_callback: Optional fn(generation, best_score) called each generation.
+        on_intent:         Optional fn(intent) called once, after Claude has parsed the
+                           description and before optimization begins. This is the only
+                           point where the intent is known but the long run has not yet
+                           started, so a CLI can report what it understood before going
+                           quiet for several minutes.
 
     Returns:
         MissionPlan containing the extracted intent, orbital bounds, and optimizer result.
@@ -187,6 +193,8 @@ def plan_mission(
         epoch = datetime.now(timezone.utc)
 
     intent = _parse_mission(description)
+    if on_intent is not None:
+        on_intent(intent)
     bounds = _intent_to_bounds(intent)
     duration_s = intent["duration_days"] * 86400.0
 

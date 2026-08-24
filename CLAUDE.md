@@ -33,9 +33,6 @@ make -j$(nproc)   # Linux/Mac
 
 # Run tests
 pytest tests/
-# On Windows, pytest's faulthandler prints "Windows fatal exception: code 0xc06d007f"
-# from numpy's LAPACK and matplotlib. It is a *handled* delay-load exception, not a
-# crash — the suite still passes. Silence it with: pytest tests/ -p no:faulthandler
 
 # End-to-end run
 python run.py "7-day sun-synchronous Earth observation at 550 km" --quick   # fast pipeline check
@@ -201,7 +198,31 @@ def batch_fitness(population):           # shape (N, 5) Keplerian params
 
 ## Current Status
 
-**76/76 tests passing.** Counts below are measured, not estimated — update them when they change.
+**86 tests. 80 verified passing; 6 blocked by a local environment fault — see below.**
+Counts are measured, not estimated — update them when they change.
+
+### ⚠️ Known environment fault (Windows / this conda env)
+
+`tests/test_integrator.py` and the two matplotlib rendering tests in
+`tests/test_composer.py` **kill the interpreter** — exit 127, no traceback, output
+truncated mid-run. Both die on a delay-load failure (`0xC06D007F` =
+`DELAYLOAD_MODULE_NOT_FOUND`) at first real use of a native library:
+
+- `test_j2_nodal_drift` → `np.polyfit` → `numpy.linalg.lstsq` → LAPACK
+- `plot_ground_track` → `ax.axhline` → matplotlib's transform machinery
+
+Every C extension *imports* fine (`matplotlib.ft2font`, `_path`, `_image`,
+`_backend_agg` all load), so it is a lazy-binding failure, not a missing module.
+It reproduces with matplotlib alone — `orbit_integrator` is not involved — and it
+is intermittent: the full suite completed 86/86 twice early in a session and then
+failed at a different test on every subsequent run.
+
+`pytest -p no:faulthandler` **hides the report, not the crash.** Do not use it to
+make the suite look green. Run per-file to isolate; the other six files pass
+cleanly and cover everything except J2 drift validation and figure rendering.
+
+Fixing it most likely means rebuilding the env (`conda env create -f environment.yml`)
+or reinstalling numpy/matplotlib from a single channel.
 
 ### Phase 1 — C++ Integrator ✓ (4/4 tests passing)
 - [x] `integrator/integrator.h` — StateVector, constants, declarations
@@ -225,11 +246,11 @@ def batch_fitness(population):           # shape (N, 5) Keplerian params
   - `OrbitalBounds.as_scipy_bounds()` → `[(lo, hi), ...]` for scipy optimizer
 - [x] `tests/test_constraint_solver.py` — 17 tests: bounds validation, SSO inclination vs. known altitudes and drift rate, per-goal-constructor bands, custom roundtrip
 
-### Phase 3b — Physics Agreement Layer ✓ (15/15 tests passing) — **not wired in**
-- [x] `physics/pre_propagation.py` — `OrbitScreen.check_pre_propagation`: perigee floor, apogee ceiling, integration window vs. orbital period. O(1), no integrator call.
-- [x] `physics/post_propagation.py` — `check_post_propagation` + `specific_energy` (2-body + J2)
+### Phase 3b — Physics Agreement Layer ✓ (15/15 tests passing)
+- [x] `physics/pre_propagation.py` — `OrbitScreen.check_pre_propagation`: perigee floor, apogee ceiling, integration window vs. orbital period. O(1), no integrator call. **Wired into `batch_fitness`**, ahead of `propagate_batch_final`, so degenerate candidates reach neither the OpenMP kernel nor the conjunction check. Rejections are counted in `OptimizationResult.screened_out`.
+- [x] `physics/post_propagation.py` — `check_post_propagation` + `specific_energy` (2-body + J2). **Not wired in** — it is an accuracy evaluator for the experiment in the Roadmap, not a production gate.
 - [x] `tests/test_pre_propagation.py` (6) + `tests/test_post_propagation.py` (9)
-- ⚠️ Nothing outside `physics/` and its own tests imports this module. See Roadmap.
+- With bounds from the goal constructors the screen normally rejects nothing; it earns its place on `custom()` bounds and on missions shorter than one orbital period, where conjunction screening would cover only part of a revolution.
 
 ### Phase 4 — Optimizer ✓ (8/8 tests passing)
 - [x] `optimizer/optimizer.py` — `keplerian_to_cartesian`, `_mission_objective`, `run_optimizer`
@@ -278,10 +299,9 @@ itself (claims energy-deviation, computes eccentricity). For a sun-synchronous r
 - Lunar/solar perturbations (n-body)
 - Adaptive step size (RK45)
 
-### Wiring the physics agreement layer
-`physics/` is written and tested but imported by nothing.
-- Wire `OrbitScreen.check_pre_propagation` into the optimizer's `batch_fitness` as a
-  pre-propagation reject, so degenerate candidates never reach the OpenMP kernel
+### Post-propagation integrity work
+The pre-propagation screen is wired in (see Phase 3b). `check_post_propagation` is not,
+and is the remaining half.
 - **Post-propagation integrity experiment:** run `check_post_propagation` across a 7-day
   mission to find where RK4 at dt=10 s violates energy/momentum thresholds; use the results
   to calibrate the tolerances. Expect failures to cluster at high eccentricity and long
