@@ -16,7 +16,15 @@ import orbit_integrator as oi
 MU_EARTH = 3.986004418e14  # m³/s²
 R_EARTH  = 6.3781e6        # m
 
-# Warn (not error) when the cached position array exceeds this size.
+# Full width of the altitude screening window around a candidate's radius.
+# _filter_by_altitude keeps objects overlapping ±_FILTER_BAND_M / 2.
+_FILTER_BAND_M = 50_000.0  # 50 km total → ±25 km
+
+# Default grid that candidate radii are snapped to for cache lookup. See
+# CatalogCache for why this exists and why it is this size.
+_BUCKET_M = 50_000.0  # 50 km
+
+# Warn (not error) when the cache's *total* footprint exceeds this size.
 _WARN_BYTES = 3 * 1024 ** 3  # 3 GB
 
 
@@ -31,7 +39,7 @@ class ConjunctionResult:
 def _filter_by_altitude(
     catalog: list[tuple[str, str, str]],
     target_sma_m: float,
-    band_m: float = 50_000.0,
+    band_m: float = _FILTER_BAND_M,
 ) -> list[tuple[str, str, str]]:
     """Keep only TLEs whose orbit intersects the altitude band around target_sma_m.
 
@@ -130,7 +138,21 @@ class CatalogCache:
 
     One instance should live for the lifetime of an optimization run. Because
     epoch, duration, and dt are fixed across all candidate orbits in a run,
-    the catalog SGP4 propagation is done once and reused for every candidate.
+    the catalog SGP4 propagation is done once per altitude bucket and reused for
+    every candidate that falls in it.
+
+    **Why bucketing.** A candidate's radius varies continuously across the
+    optimizer's sma band, so keying on it directly gives a distinct entry per
+    candidate — each a (T, N, 3) float64 array that can run to hundreds of MB.
+    An SSO run over a ±20 km band produced ~41 of them. Radii are therefore
+    snapped to a `bucket_m` grid before lookup.
+
+    **Why this is safe.** Each bucket's screening band is widened by a full
+    bucket width, so a candidate anywhere in the bucket still has its entire
+    ±_FILTER_BAND_M / 2 window inside the cached set. The set shared by a bucket
+    is always a superset of what any individual candidate would have got on its
+    own, never a subset — sharing an entry cannot hide a conjunction. The extra
+    objects are simply further away and do not cross the threshold.
 
     Usage:
         cache = CatalogCache()
@@ -138,8 +160,21 @@ class CatalogCache:
         results = check_conjunctions(..., catalog_cache=cache)
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        bucket_m: float = _BUCKET_M,
+        warn_bytes: float = _WARN_BYTES,
+    ) -> None:
         self._store: dict = {}
+        self.bucket_m   = bucket_m
+        self._warn_bytes = warn_bytes
+        self._nbytes    = 0      # cumulative across every entry held
+        self._warned    = False  # warn once per cache, not once per entry
+
+    @property
+    def nbytes(self) -> int:
+        """Total bytes held across all cached position arrays."""
+        return self._nbytes
 
     def get_or_compute(
         self,
@@ -151,16 +186,13 @@ class CatalogCache:
     ) -> tuple[np.ndarray, list[str], list[str]]:
         """Return (catalog_pos (T,N,3) m, names, norad_ids) for the given parameters.
 
-        Altitude is rounded to the nearest km so candidate orbits at the same
-        shell share a cache entry even if their exact radii differ slightly.
+        The radius is snapped to the bucket grid so nearby candidates share an
+        entry; the bucket's band is widened to compensate. See the class docstring.
         """
-        # round(..., -3) rounds to the nearest 1000 m (1 km).  Candidate orbits
-        # at the same shell but slightly different radii (e.g. 6878.1 km vs
-        # 6878.4 km) share a single cache entry rather than computing separate
-        # arrays that are effectively identical for conjunction screening purposes.
-        key = (epoch.isoformat(), duration_s, dt, round(target_sma_m, -3))
+        bucket = round(target_sma_m / self.bucket_m) * self.bucket_m
+        key = (epoch.isoformat(), duration_s, dt, bucket)
         if key not in self._store:
-            self._store[key] = self._compute(catalog, epoch, duration_s, dt, target_sma_m)
+            self._store[key] = self._compute(catalog, epoch, duration_s, dt, bucket)
         return self._store[key]
 
     def _compute(
@@ -169,9 +201,13 @@ class CatalogCache:
         epoch: datetime,
         duration_s: float,
         dt: float,
-        target_sma_m: float,
+        bucket_centre_m: float,
     ) -> tuple[np.ndarray, list[str], list[str]]:
-        filtered = _filter_by_altitude(catalog, target_sma_m)
+        # Widen by a full bucket width: a candidate at the edge of this bucket sits
+        # bucket_m / 2 from the centre and still needs its own ±_FILTER_BAND_M / 2
+        # window covered, so the half-widths add.
+        band_m = _FILTER_BAND_M + self.bucket_m
+        filtered = _filter_by_altitude(catalog, bucket_centre_m, band_m=band_m)
         if not filtered:
             return np.empty((0, 0, 3)), [], []
 
@@ -185,13 +221,19 @@ class CatalogCache:
 
         # T steps × N objects × 3 coords × 8 bytes (float64)
         nbytes = T * N * 3 * 8
-        if nbytes > _WARN_BYTES:
+        self._nbytes += nbytes
+        # Budget the cache as a whole, not each entry: the failure mode is many
+        # moderate arrays accumulating across a run, which a per-entry check
+        # never catches.  Warn once — a run that trips this trips it repeatedly.
+        if self._nbytes > self._warn_bytes and not self._warned:
+            self._warned = True
             # stacklevel=4 surfaces the warning at the check_conjunctions call
             # site in user code rather than inside this private method chain.
             warnings.warn(
-                f"Catalog position array is {nbytes / 1024 ** 3:.1f} GB "
-                f"({N} objects × {T} steps). Consider reducing duration_s "
-                f"or widening the altitude band.",
+                f"CatalogCache is holding {self._nbytes / 1024 ** 3:.1f} GB across "
+                f"{len(self._store) + 1} altitude buckets "
+                f"(latest: {N} objects × {T} steps). Consider reducing duration_s, "
+                f"increasing dt, or narrowing the optimizer's sma bounds.",
                 ResourceWarning,
                 stacklevel=4,
             )

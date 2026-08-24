@@ -144,7 +144,9 @@ The original conjunction checker looped over T time steps in Python, calling `Sa
 
 2. **`_compute_catalog_positions(sats, epoch, n_steps, dt)`** — single `SatrecArray.sgp4(jd_arr, fr_arr)` call with a T-length time array. Returns `(T, N, 3)` position array in meters. Replaces T sequential Python → C extension round trips with one call.
 
-3. **`CatalogCache`** — in-memory dict keyed by `(epoch, duration_s, dt, round(sma, -3))`. One instance per optimizer run. The `round(..., -3)` (nearest 1 km) lets candidate orbits at the same shell share a cache entry. Raises a `ResourceWarning` if the array would exceed 3 GB.
+3. **`CatalogCache`** — in-memory dict keyed by `(epoch, duration_s, dt, bucket)`, one instance per optimizer run. `bucket` snaps the candidate's radius to a 50 km grid (`_BUCKET_M`), and each bucket's screening band is widened by a full bucket width so a candidate anywhere inside it still has its whole ±25 km window covered. **The shared set is always a superset of what a candidate would screen alone, never a subset** — sharing an entry cannot hide a conjunction. Warns once via `ResourceWarning` when the cache's *total* footprint crosses 3 GB.
+
+   The key was previously `round(sma, -3)` — the nearest kilometre — which produced one multi-hundred-MB array per distinct kilometre of the sma band (~41 for a ±20 km SSO run, ~9 GB on a 7-day mission). The per-entry memory guard never fired, because no single entry was the problem. Bucketing cuts that ~20× at the cost of roughly 2× the objects per entry.
 
 4. **Fully vectorized separation** in `check_conjunctions`: `(T, N, 3) - (T, 1, 3)` broadcast → `np.linalg.norm(axis=2)` → `(T, N)`. No Python loop over time steps.
 

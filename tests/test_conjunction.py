@@ -18,6 +18,7 @@ from awareness.tle_fetcher import _parse, fetch_tles
 from awareness.conjunction import (
     CatalogCache,
     ConjunctionResult,
+    _FILTER_BAND_M,
     _compute_catalog_positions,
     _filter_by_altitude,
     check_conjunctions,
@@ -41,6 +42,19 @@ _FAKE_TLE_TEXT = "\n".join([
     "1 99002U 23001B   24001.00000000  .00000000  00000+0  00000+0 0  9999",
     "2 99002  51.6000 000.0000 0001000  90.0000 270.0000 15.50000000 00002",
 ])
+
+
+def _make_tle(alt_km: float, norad_id: int, ecc: float = 0.0001) -> tuple:
+    """Construct a minimal TLE for a given circular-ish altitude."""
+    a         = R_EARTH + alt_km * 1e3
+    n_rev_day = np.sqrt(MU_EARTH / a ** 3) * 86400.0 / (2.0 * np.pi)
+    ecc_str   = f"{int(ecc * 1e7):07d}"
+    name  = f"TEST-{alt_km:.0f}KM"
+    line1 = (f"1 {norad_id:05d}U 24001A   24001.00000000  .00000000"
+             f"  00000+0  00000+0 0  9990")
+    line2 = (f"2 {norad_id:05d}  97.0000   0.0000 {ecc_str}  90.0000"
+             f" 270.0000 {n_rev_day:11.8f}    10")
+    return (name, line1, line2)
 
 
 def _make_mock_session(text: str) -> MagicMock:
@@ -184,18 +198,6 @@ def test_catalog_cache_hit():
 # Test 6 — Altitude filter: TLE string parsing selects correct orbit shells
 # ---------------------------------------------------------------------------
 def test_altitude_filter():
-    def _make_tle(alt_km: float, norad_id: int, ecc: float = 0.0001) -> tuple:
-        """Construct a minimal TLE for a given circular-ish altitude."""
-        a         = R_EARTH + alt_km * 1e3
-        n_rev_day = np.sqrt(MU_EARTH / a ** 3) * 86400.0 / (2.0 * np.pi)
-        ecc_str   = f"{int(ecc * 1e7):07d}"
-        name  = f"TEST-{alt_km:.0f}KM"
-        line1 = (f"1 {norad_id:05d}U 24001A   24001.00000000  .00000000"
-                 f"  00000+0  00000+0 0  9990")
-        line2 = (f"2 {norad_id:05d}  97.0000   0.0000 {ecc_str}  90.0000"
-                 f" 270.0000 {n_rev_day:11.8f}    10")
-        return (name, line1, line2)
-
     # Circular orbit at the target altitude — should pass.
     tle_500 = _make_tle(500.0, 11001)
 
@@ -216,3 +218,80 @@ def test_altitude_filter():
     assert "TEST-500KM"  in names, "Circular orbit at target altitude should be included"
     assert "TEST-525KM"  in names, "Eccentric orbit crossing the band should be included"
     assert "TEST-1000KM" not in names, "Orbit at 1000 km should be excluded"
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — CatalogCache bucketing: bounded entry count, no loss of coverage
+# ---------------------------------------------------------------------------
+def test_catalog_cache_buckets_nearby_radii():
+    """Candidates spread across an sma band must share cache entries.
+
+    Regression: the key rounded the radius to the nearest 1 km, so an SSO run
+    over a +/-20 km band produced ~41 entries, each a full (T, N, 3) array —
+    hundreds of MB apiece on a 7-day mission.
+    """
+    epoch   = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    catalog = [_make_tle(550.0, 12001)]
+    cache   = CatalogCache(bucket_m=50_000.0)
+
+    base = R_EARTH + 550e3
+    for offset_km in range(-20, 21):          # 41 distinct radii, 1 km apart
+        cache.get_or_compute(catalog, epoch, 3600.0, 30.0, base + offset_km * 1e3)
+
+    assert len(cache._store) <= 2, (
+        f"41 radii across a 40 km band produced {len(cache._store)} cache entries; "
+        "a 50 km bucket grid should collapse them to at most 2"
+    )
+
+
+def test_catalog_cache_bucket_covers_band_edges():
+    """A shared bucket must cover every radius that maps into it.
+
+    Bucketing is only safe if the shared object set is a superset of what each
+    candidate would have screened alone. A candidate at the edge of a bucket
+    screens up to half a band beyond the bucket edge, so an object out there
+    must still be present — otherwise sharing an entry hides a conjunction.
+    """
+    epoch    = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    bucket_m = 50_000.0
+    centre   = round((R_EARTH + 550e3) / bucket_m) * bucket_m
+
+    # Worst case: a candidate sitting exactly on the bucket's upper edge.
+    edge_target = centre + bucket_m / 2.0
+    # An object just inside that candidate's own screening band.
+    obj_sma     = edge_target + _FILTER_BAND_M / 2.0 - 1_000.0
+    far_object  = _make_tle((obj_sma - R_EARTH) / 1e3, 12002)
+
+    # Sanity: the object really is one the edge candidate would screen alone.
+    assert _filter_by_altitude([far_object], edge_target), \
+        "test setup: object should fall inside the edge candidate's own band"
+
+    cache = CatalogCache(bucket_m=bucket_m)
+    _, names, _ = cache.get_or_compute([far_object], epoch, 3600.0, 30.0, edge_target)
+
+    assert names, (
+        "object inside the edge candidate's own screening band was dropped from "
+        "the shared bucket entry — bucketing must widen the band, not narrow it"
+    )
+
+
+def test_catalog_cache_budget_is_cumulative():
+    """The memory guard applies to the cache as a whole, not one entry at a time.
+
+    Regression: the check was per-array, so a run accumulating many moderate
+    entries — the actual failure mode — never tripped it.
+    """
+    epoch   = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    catalog = [_make_tle(500.0 + 100.0 * i, 12100 + i) for i in range(6)]
+
+    # Budget deliberately larger than any single entry, smaller than the total.
+    cache = CatalogCache(bucket_m=50_000.0, warn_bytes=1_000)
+
+    with pytest.warns(ResourceWarning, match="CatalogCache is holding"):
+        for i in range(6):
+            cache.get_or_compute(
+                catalog, epoch, 300.0, 30.0, R_EARTH + 500e3 + 100e3 * i
+            )
+
+    assert cache.nbytes > 1_000
+    assert len(cache._store) > 1, "budget should be exceeded by accumulation, not one entry"
