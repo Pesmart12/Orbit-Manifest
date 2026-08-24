@@ -221,8 +221,27 @@ failed at a different test on every subsequent run.
 make the suite look green. Run per-file to isolate; the other six files pass
 cleanly and cover everything except J2 drift validation and figure rendering.
 
-Fixing it most likely means rebuilding the env (`conda env create -f environment.yml`)
-or reinstalling numpy/matplotlib from a single channel.
+Narrowing so far — `ax.plot()` succeeds, `ax.axhline()` and `fig.savefig()` both
+die. What separates them is that plot alone never forces a full transform/render
+evaluation, so the fault is in rendering, not in any one API.
+
+**Ruled out** (all checked, none fixed it):
+- Channel mixing — the env is 122 conda-forge + pip-only packages, no `defaults`
+- `orbit_integrator` — reproduces with matplotlib alone, extension never imported
+- Working directory / DLL shadowing — fails identically from three different cwds
+- Missing C extensions — `ft2font`, `_path`, `_image`, `_backend_agg` all import
+- Visual C++ runtime — `msvcp140`, `vcruntime140{,_1}`, `concrt140` present in both
+  the env and System32
+- **Force-reinstalling `matplotlib`, `freetype`, `numpy`, `scipy` from conda-forge**
+
+One real defect was found and fixed along the way: `scipy` had been pip-installed
+over the conda-forge one. It is now conda-forge, matching `environment.yml`. That
+did not fix the crash.
+
+Since a targeted reinstall does not clear it, the next step is a clean rebuild:
+`conda env remove -n orbit-manifest && conda env create -f environment.yml`, then
+`pip install -r requirements.txt` and `pip install -e .`. Note `scipy` must come
+from conda, not pip.
 
 ### Phase 1 — C++ Integrator ✓ (4/4 tests passing)
 - [x] `integrator/integrator.h` — StateVector, constants, declarations
