@@ -7,7 +7,11 @@ orbit_manifest.egg-info/PKG-INFO
 orbit_manifest.egg-info/SOURCES.txt
 orbit_manifest.egg-info/dependency_links.txt
 orbit_manifest.egg-info/top_level.txt
+tests/test_agent.py
+tests/test_composer.py
 tests/test_conjunction.py
 tests/test_constraint_solver.py
 tests/test_integrator.py
-tests/test_physics_agreement.py
+tests/test_optimizer.py
+tests/test_post_propagation.py
+tests/test_pre_propagation.py

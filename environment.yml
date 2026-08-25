@@ -12,6 +12,11 @@ dependencies:
   - numpy
   - scipy
   - matplotlib
+  # Pin the BLAS implementation to OpenBLAS. The MKL build conda-forge resolves
+  # to on this platform kills the interpreter on matrix multiply — a delay-load
+  # failure (0xC06D007F), not a Python exception. Without this pin a fresh
+  # `conda env create` reintroduces the bug. See CLAUDE.md → Known environment fault.
+  - libblas=*=*openblas
   # networking / config
   - requests
   - python-dotenv

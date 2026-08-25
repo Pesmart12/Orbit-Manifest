@@ -198,50 +198,40 @@ def batch_fitness(population):           # shape (N, 5) Keplerian params
 
 ## Current Status
 
-**86 tests. 80 verified passing; 6 blocked by a local environment fault — see below.**
-Counts are measured, not estimated — update them when they change.
+**86/86 tests passing.** Counts are measured, not estimated — update them when they change.
 
-### ⚠️ Known environment fault (Windows / this conda env)
+### Known environment fault — numpy's MKL BLAS (resolved; keep the pin)
 
-`tests/test_integrator.py` and the two matplotlib rendering tests in
-`tests/test_composer.py` **kill the interpreter** — exit 127, no traceback, output
-truncated mid-run. Both die on a delay-load failure (`0xC06D007F` =
-`DELAYLOAD_MODULE_NOT_FOUND`) at first real use of a native library:
+**Symptom:** the interpreter dies — exit 127, no traceback, output truncated
+mid-run — on a delay-load failure (`0xC06D007F` = `DELAYLOAD_MODULE_NOT_FOUND`).
+It looks like a matplotlib or pytest problem and is neither.
 
-- `test_j2_nodal_drift` → `np.polyfit` → `numpy.linalg.lstsq` → LAPACK
-- `plot_ground_track` → `ax.axhline` → matplotlib's transform machinery
+**Cause:** the MKL build conda-forge resolved to on this platform crashes on
+matrix multiply. A bare `numpy.arange(9).reshape(3,3) @ numpy.eye(3)` is enough
+to kill the process. Everything downstream of a matmul inherited it:
 
-Every C extension *imports* fine (`matplotlib.ft2font`, `_path`, `_image`,
-`_backend_agg` all load), so it is a lazy-binding failure, not a missing module.
-It reproduces with matplotlib alone — `orbit_integrator` is not involved — and it
-is intermittent: the full suite completed 86/86 twice early in a session and then
-failed at a different test on every subsequent run.
+- `test_j2_nodal_drift` → `np.polyfit` → `np.linalg.lstsq` → LAPACK
+- `plot_ground_track` → `ax.axhline` → matplotlib composes a *blended* transform
+  → matrix multiply. `ax.plot()` survives because it reuses `transData` directly
+  and never multiplies.
 
-`pytest -p no:faulthandler` **hides the report, not the crash.** Do not use it to
-make the suite look green. Run per-file to isolate; the other six files pass
-cleanly and cover everything except J2 drift validation and figure rendering.
+**Fix:** `environment.yml` pins `libblas=*=*openblas`. Without that pin a fresh
+`conda env create` resolves to MKL again and the bug returns. To repair an env
+that already has MKL:
 
-Narrowing so far — `ax.plot()` succeeds, `ax.axhline()` and `fig.savefig()` both
-die. What separates them is that plot alone never forces a full transform/render
-evaluation, so the fault is in rendering, not in any one API.
+```bash
+conda install -n orbit-manifest -c conda-forge "libblas=*=*openblas"
+```
 
-**Ruled out** (all checked, none fixed it):
-- Channel mixing — the env is 122 conda-forge + pip-only packages, no `defaults`
-- `orbit_integrator` — reproduces with matplotlib alone, extension never imported
-- Working directory / DLL shadowing — fails identically from three different cwds
-- Missing C extensions — `ft2font`, `_path`, `_image`, `_backend_agg` all import
-- Visual C++ runtime — `msvcp140`, `vcruntime140{,_1}`, `concrt140` present in both
-  the env and System32
-- **Force-reinstalling `matplotlib`, `freetype`, `numpy`, `scipy` from conda-forge**
+**Do not use `pytest -p no:faulthandler` to make this go away.** It hides the
+report, not the crash. If a suite ever ends with truncated dots and no summary
+line, run `python -c "import numpy; print(numpy.eye(3) @ numpy.eye(3))"` first.
 
-One real defect was found and fixed along the way: `scipy` had been pip-installed
-over the conda-forge one. It is now conda-forge, matching `environment.yml`. That
-did not fix the crash.
-
-Since a targeted reinstall does not clear it, the next step is a clean rebuild:
-`conda env remove -n orbit-manifest && conda env create -f environment.yml`, then
-`pip install -r requirements.txt` and `pip install -e .`. Note `scipy` must come
-from conda, not pip.
+Ruled out along the way, none of them the cause: channel mixing, the C++
+extension, working-directory DLL shadowing, missing C extensions, the Visual C++
+runtime, matplotlib backend choice (svg/pdf/agg all failed), a force-reinstall of
+matplotlib/freetype/numpy/scipy, and a full env rebuild. One unrelated defect was
+fixed en route: `scipy` had been pip-installed over the conda-forge package.
 
 ### Phase 1 — C++ Integrator ✓ (4/4 tests passing)
 - [x] `integrator/integrator.h` — StateVector, constants, declarations
