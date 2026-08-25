@@ -414,3 +414,51 @@ def test_empty_catalog_body_raises_instead_of_caching(tmp_path, monkeypatch):
             fetch_tles(cache_ttl=0)
 
     assert not cache_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — _parse must not silently drop objects on either Space-Track format
+# ---------------------------------------------------------------------------
+def _pair(norad: int) -> tuple[str, str]:
+    return (f"1 {norad:05d}U 24001A   24001.00000000  .00000000  00000+0  00000+0 0  9990",
+            f"2 {norad:05d}  97.0000   0.0000 0001000  90.0000 270.0000 15.00000000 00001")
+
+
+def test_parse_two_line_format_keeps_every_object():
+    """format/tle returns bare pairs with no name line.
+
+    Regression: _parse stepped by 3 assuming 3-line groups, so against 2-line
+    data it kept one object in three and used the previous object's line 2 as
+    the name. A live pull returned 10,788 objects out of roughly 32,000, and
+    every name was a raw TLE line — silently, because each emitted tuple was
+    internally well-formed.
+    """
+    n = 9
+    text = "\n".join(l for i in range(n) for l in _pair(20000 + i))
+    parsed = _parse(text)
+
+    assert len(parsed) == n, f"expected all {n} objects, kept {len(parsed)}"
+    for name, l1, l2 in parsed:
+        assert not name.startswith(("1 ", "2 ")), f"name is a TLE line: {name!r}"
+        assert l1.startswith("1 ") and l2.startswith("2 ")
+        assert l1[2:7] == l2[2:7], "line1/line2 NORAD ids must match"
+
+
+def test_parse_three_line_format_uses_real_names():
+    """format/3le prefixes each pair with '0 NAME' — the name must survive."""
+    entries = [("ISS (ZARYA)", 25544), ("STARLINK-1007", 44713), ("COSMOS 2251 DEB", 34561)]
+    text = "\n".join(
+        line for name, norad in entries for line in (f"0 {name}", *_pair(norad))
+    )
+    parsed = _parse(text)
+
+    assert len(parsed) == len(entries)
+    assert [p[0] for p in parsed] == [e[0] for e in entries], "names should round-trip"
+
+
+def test_parse_survives_a_malformed_entry_without_losing_the_rest():
+    """A stray line must not shift the grouping and swallow later objects."""
+    good = "\n".join(l for i in range(4) for l in _pair(30000 + i))
+    text = good + "\nGARBAGE LINE THAT IS NOT A TLE\n" + "\n".join(_pair(39999))
+    parsed = _parse(text)
+    assert len(parsed) == 5, f"expected 4 good + 1 after the garbage, got {len(parsed)}"

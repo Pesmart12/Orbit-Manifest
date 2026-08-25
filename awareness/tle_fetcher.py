@@ -18,11 +18,15 @@ TTL_SECONDS = 86400  # 24 hours
 LOGIN_URL   = "https://www.space-track.org/ajaxauth/login"
 
 # Query: all GP (general perturbations) elements whose epoch is within the
-# last 30 days, sorted by NORAD ID, returned as raw two-line element text.
+# last 30 days, sorted by NORAD ID.
 # EPOCH/>now-30 keeps us under the 100 k object ceiling and discards stale debris.
+#
+# format/3le, not format/tle. `tle` returns bare two-line pairs with no names,
+# which left every ConjunctionResult.name showing a raw TLE line. `3le` prefixes
+# each pair with a "0 SATELLITE NAME" line. _parse handles both regardless.
 CATALOG_URL = (
     "https://www.space-track.org/basicspacedata/query"
-    "/class/gp/EPOCH/%3Enow-30/orderby/NORAD_CAT_ID/format/tle"
+    "/class/gp/EPOCH/%3Enow-30/orderby/NORAD_CAT_ID/format/3le"
 )
 
 
@@ -90,21 +94,46 @@ def _download() -> list[tuple[str, str, str]]:
 
 
 def _parse(text: str) -> list[tuple[str, str, str]]:
-    """Convert raw TLE text into a list of (name, line1, line2) tuples.
+    """Convert raw Space-Track text into a list of (name, line1, line2) tuples.
 
-    The Space-Track TLE format is three lines per object:
-        Line 0 — satellite name (free text)
-        Line 1 — TLE line 1, always starts with '1 '
-        Line 2 — TLE line 2, always starts with '2 '
+    Handles both formats Space-Track can return:
 
-    The startswith checks guard against malformed entries (incomplete objects,
-    blank separators) that would shift the 3-line grouping off by one.
+        3LE (format/3le)    "0 ISS (ZARYA)" / "1 25544U ..." / "2 25544 ..."
+        TLE (format/tle)    "1 25544U ..." / "2 25544 ..."      — no name line
+
+    Objects with no name line are labelled "NORAD <id>" so the identifier in a
+    conjunction report is always meaningful.
+
+    This walks the lines rather than stepping by a fixed stride. The previous
+    version assumed 3-line groups and advanced `range(0, len, 3)`, which against
+    the 2-line data the query actually requested captured **one object in three**
+    and used the preceding object's line 2 as the name — silently, because every
+    tuple it did emit was internally well-formed.
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    out = []
-    for i in range(0, len(lines) - 2, 3):
-        name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
-        # Skip any group that doesn't look like a valid TLE pair.
-        if l1.startswith("1 ") and l2.startswith("2 "):
-            out.append((name, l1, l2))
+    out: list[tuple[str, str, str]] = []
+    i = 0
+    while i < len(lines) - 1:
+        line = lines[i]
+
+        # Bare pair: line 1 immediately followed by line 2.
+        if line.startswith("1 ") and lines[i + 1].startswith("2 "):
+            out.append((f"NORAD {line[2:7].strip()}", line, lines[i + 1]))
+            i += 2
+            continue
+
+        # Name line followed by the pair. 3LE prefixes the name with "0 ".
+        if (
+            i + 2 < len(lines)
+            and lines[i + 1].startswith("1 ")
+            and lines[i + 2].startswith("2 ")
+        ):
+            name = line[2:].strip() if line.startswith("0 ") else line
+            out.append((name or f"NORAD {lines[i + 1][2:7].strip()}",
+                        lines[i + 1], lines[i + 2]))
+            i += 3
+            continue
+
+        i += 1   # unrecognised line — skip it rather than shifting the grouping
+
     return out

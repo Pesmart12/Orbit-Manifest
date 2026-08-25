@@ -34,7 +34,7 @@ pytest tests/
 
 # End-to-end run
 python run.py "7-day sun-synchronous Earth observation at 550 km" --quick   # fast pipeline check
-python run.py "7-day sun-synchronous Earth observation at 550 km"             # full run (duration depends on catalog density — see Performance)
+python run.py "7-day sun-synchronous Earth observation at 550 km"             # full run (~12 h at 550 km — see Performance)
 ```
 
 ---
@@ -212,51 +212,42 @@ def batch_fitness(population):        # scipy hands over (n_params, S) — trans
 
 ---
 
-## Performance — what is measured and what is not
+## Performance — measured against the live catalog
 
-**No figure here has been checked against a real catalog.** The pipeline has never
-run against live Space-Track data; `data/tle_cache.json` has only ever held an
-empty list. Treat everything below as shape, not magnitude.
+Measured 2026-08-25 on the real Space-Track catalog (32,364 objects, EPOCH >
+now-30), SSO 550 km, 7-day mission at dt=60 s (T=10,081), on this machine.
 
-**Measured** (2026-08-24, this machine, 7-day mission at dt=60 s → T=10,081 steps,
-population 75):
+**N — the object count surviving the altitude filter — is 4,873.** Every earlier
+estimate in this file was wrong because N was guessed. The previously documented
+"~2 s/generation, ~17 min" implies N≈110; the real shell is 44x denser than that.
 
-| Component | Per generation | Notes |
+| Component | Cost | Notes |
 |---|---|---|
-| `propagate_batch` (OpenMP, whole population) | **7.3 ms** | no production caller — see Architecture Rules |
-| `propagate_single` × 75 (what the loop does today) | **34.7 ms** | serial, from Python |
-| Conjunction separation | **~493 ms × 75** | scales linearly with N — see below |
+| Catalog SGP4, per bucket (cold) | 11.3 s | once per altitude bucket, then cached |
+| Separation, per candidate (warm) | **1,142 ms** | this is the entire hot path |
+| Propagation, whole population (OpenMP) | 7.3 ms | no production caller |
+| Cache entry | **1.1 GB** | (T x N x 3 x 8 bytes) |
 
-Propagation is **0.02%** of a generation. Separation is effectively all of it, so
-the Amdahl ceiling from making propagation infinitely fast is 1.00x. Any
-optimization effort belongs in the separation path.
-
-**Everything hinges on N**, the object count surviving the altitude filter, which
-is the one number we do not have. Separation is memory-bandwidth-bound and linear
-in N, so:
-
-| Objects in band (N) | Per generation | 500 generations |
+| Run | Per generation | Total |
 |---|---|---|
-| 110 | ~2.0 s | ~17 min |
-| 500 | ~9.2 s | ~1.3 h |
-| 1,000 | ~18.5 s | ~2.6 h |
-| 2,000 | ~37 s | ~5.1 h |
+| `--quick` (popsize=5, maxiter=20) | 28.6 s | **~9.5 min** |
+| full (popsize=15, maxiter=500) | 85.7 s | **~11.9 hours** |
 
-The previously documented "~2 s/generation, ~17 min" corresponds to N≈110. Either
-that came from a much narrower shell than the current filter produces, or it was
-never right. **Measuring the real N is the first thing a live run should settle.**
+A full run is twelve hours, not seventeen minutes. Separation is ~100% of it.
 
-Two known influences on N and on this cost:
+**Bucketing costs 39%.** The `CatalogCache` band widening (±25 km → ±50 km, so a
+shared bucket entry stays a superset for every candidate in it) takes N from
+3,498 to 4,873. That is real but far less than the 2x a uniform-density shell
+would predict — LEO object density varies sharply with altitude. `_BUCKET_M` is
+tunable: narrowing it cuts N and the per-entry footprint, at the price of more
+entries.
 
-- `CatalogCache` bucketing widened the screening band from ±25 km to ±50 km so a
-  shared bucket entry stays a superset for every candidate in it. That roughly
-  doubles N, and therefore roughly doubles the dominant cost. `_BUCKET_M` is
-  tunable and was chosen by reasoning, not measurement.
-- The separation code allocates a `(T, N, 3)` temporary per candidate — 461 MB at
-  N=2,000. Chunking over time gives identical results at **2.1x** (493 → 235 ms),
-  and float32 would roughly halve bandwidth again at ~1 m resolution against a
-  5 km threshold. Both are free of new dependencies and worth taking before any
-  GPU work.
+**Headroom, in the order worth taking it** (see Roadmap → Conjunction separation
+performance): the separation code allocates a 1.1 GB `(T, N, 3)` temporary per
+candidate; chunking over time measured 2.1x with identical results, float32 would
+roughly halve bandwidth again, and an algorithmic pre-filter that excludes
+objects whose orbital planes cannot approach the threshold would cut N directly.
+Pedro's preference for the GPU step is CuPy.
 
 ---
 
