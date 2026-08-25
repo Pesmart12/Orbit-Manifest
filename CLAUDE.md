@@ -335,6 +335,77 @@ fixed en route: `scipy` had been pip-installed over the conda-forge package.
 
 ---
 
+## Next Steps — resume here (as of 2026-08-25)
+
+State: 115 tests passing on both backends, working tree clean, everything pushed.
+The pipeline has never completed a full 500-generation run; the longest was 14
+generations. Ordered by what I would do first.
+
+### 1. Anthropic credits — the only hard blocker
+`ANTHROPIC_API_KEY` in `.env` is **valid** (verified against `models.list()`), but
+the account has no credits, so `run.py` dies at `_parse_mission` with
+`invalid_request_error: credit balance is too low`. Everything downstream works —
+the measurement runs bypassed it by supplying the intent dict directly:
+
+```python
+intent = {"orbit_type": "sun_synchronous", "altitude_km": 550.0,
+          "duration_days": 7.0, "rationale": "..."}
+bounds = _intent_to_bounds(intent)          # then run_optimizer(...) as normal
+```
+
+One parse call costs ~$0.006, so a minimum top-up covers hundreds of runs.
+Space-Track credentials work; note it throttles after a few rapid failures and
+returns the same `{"Login":"Failed"}` for throttling as for a wrong password —
+if it rejects known-good credentials, wait rather than retrying.
+
+### 2. Tighten the level-2 promotion gate — biggest remaining win
+`_refine_gate` bounds relative velocity at two circular velocities (a head-on
+retrograde pass). Correct as a worst case, far too generous for an SSO mission
+meeting mostly near-polar traffic, and it promotes **63.5%** of the band, making
+level 2 the dominant cost (87 ms of 135 ms per candidate).
+
+**Trap:** the obvious triangle-inequality form `|Δcatalog| + |Δmission|` collapses
+to exactly the same head-on number and buys nothing. A useful bound needs the
+actual *relative* displacement per object, which is already being formed inside
+`_closest_approaches` — computing a per-object max there is the cheap place to get
+it. Halving promotion roughly halves a run.
+
+### 3. Chase the 23 km worst-case sieve error
+Everything else is exact (median and p95 both 0 m against a 1 s reference), so one
+outlier at 23 km stands out. Likely a third close approach that level 2's grid
+also mis-ranks. Worth identifying before adding machinery: it may be one bad TLE
+rather than a structural gap. Reproduce with the dt-ladder comparison in the
+session's `sampling_error.py` approach — run `check_conjunctions` at dt=60, 10 and
+1 with `threshold_m=1e9` and diff the per-object dictionaries.
+
+### 4. Verify the level-2 budget does not silently degrade a real run
+`_FINE_BUDGET_BYTES` is 3 GB. Objects beyond it keep their **level-1** separation,
+which can overestimate a close approach — the cache warns once via
+`ResourceWarning`. Nobody has watched a long run to see whether it fills. If it
+does, either raise the budget or make the eviction preference explicit (currently
+first-come). Do not let this fail quietly; it is the one place the sieve can
+regress to the behaviour it was built to fix.
+
+### 5. Decide the fate of `propagate_batch` / `propagate_batch_final`
+Neither has a production caller. `CMakeLists.txt` carries
+`find_package(OpenMP REQUIRED)` and `setup.py` passes `/openmp` for parallel
+regions nothing reaches. Either wire batching into the conjunction layer (a ~0.02%
+gain — propagation is 7.3 ms against 85+ s of separation) or delete both and drop
+the OpenMP build dependency. Leaving it as-is is the one option with no upside.
+
+### 6. Retire `_refine_candidates`
+Superseded by `_sieve`, kept opt-in (`refine=True`) for a final verification pass.
+It refines around the coarse argmin, which cannot fix a mis-identified event —
+the exact limitation the sieve exists to solve. If nothing uses it by the next
+pass, delete it.
+
+### Figures are a band, not a constant
+Screened count depends on where the optimizer wanders: 4,807 objects at the band
+centre, 8,019 in one real run that drifted lower into denser traffic. Quote ranges
+when reporting performance.
+
+---
+
 ## Roadmap — Specified but Not Built
 
 None of the following exists in the pipeline. Do not describe any of it as implemented.
