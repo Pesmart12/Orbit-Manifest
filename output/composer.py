@@ -212,7 +212,9 @@ def format_report(plan: MissionPlan, epoch: datetime | None = None) -> str:
         "  OPTIMIZER STATISTICS",
         _BAR,
         f"  Converged:         {'Yes' if plan.result.success else 'No':>10}",
-        f"  Objective (ecc):   {plan.result.objective:>10.6f}",
+        # The objective is negated conjunction margin in metres; report it as the
+        # positive clearance it represents rather than as a raw internal score.
+        f"  Objective (margin):{-plan.result.objective / 1000.0:>10.2f} km",
         f"  Generations:       {plan.result.n_generations:>10,}",
         f"  Conjunction calls: {plan.result.conjunctions_checked:>10,}",
         f"  Wall-clock time:   {plan.result.elapsed_s:>10.1f} s",

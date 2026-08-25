@@ -113,7 +113,8 @@ const double OMEGA_EARTH = 7.2921150e-5;    // rad/s
 - **Agent layer is last.** All physics and optimization must work before adding the NL interface.
 - **State vectors in SI units throughout** — meters, meters/second, seconds. Convert at boundaries only.
 - **pybind11 interface stays simple** — numpy arrays in, numpy arrays out. No complex C++ objects crossing the boundary.
-- **Optimizer uses `workers=1` with `updating='deferred'`.** Do not use `workers=-1` (scipy multiprocessing) — it conflicts with OpenMP. OpenMP inside `propagate_batch_final` handles parallelism. `updating='deferred'` is required to collect the full population before evaluating, enabling true batch propagation.
+- **Optimizer uses `workers=1` with `updating='deferred'` and `vectorized=True`.** scipy overrides `vectorized` whenever `workers != 1`, so `workers=1` is a requirement of the vectorized contract, not merely a way to avoid fighting OpenMP. `updating='deferred'` is required to collect the full population before evaluating.
+- **The optimizer no longer batch-propagates.** Since the objective became conjunction margin, each candidate needs one mission propagation, and `nearest_approach` does it internally. The old loop propagated every candidate twice — once through `propagate_batch_final` for the eccentricity objective, once again inside `check_conjunctions`. `propagate_batch_final` remains part of the C++ API and is still validated by `tests/test_integrator.py`; feeding batched trajectories into the conjunction layer to restore OpenMP batching is an open optimization (see Roadmap).
 - **CatalogCache lives for the lifetime of an optimizer run.** Instantiate once before the optimization loop and pass it to every `check_conjunctions` call. Never create a new CatalogCache inside the fitness function.
 - **No PINN surrogate for the integrator.** The RK4 batch propagation (~70 ms/generation) is not the bottleneck — conjunction checking was (~37 s/generation). Approximating the integrator introduces position errors that could produce false-negative conjunction results, which is a safety failure.
 
@@ -153,7 +154,7 @@ The original conjunction checker looped over T time steps in Python, calling `Sa
 
 **Algorithm:** `scipy.optimize.differential_evolution`
 - Gradient-free — conjunction penalties create hard discontinuities that break gradient-based solvers (SLSQP, L-BFGS-B)
-- Population-based — maps directly onto `propagate_batch_final`; the population of ~75 candidates per generation is the batch
+- Population-based — a generation of ~75 candidates is evaluated together via `vectorized=True`
 - Global search — the safe-orbit landscape has multiple feasible pockets separated by conjunction-blocked corridors
 
 **Search space:** 5 Keplerian elements `[sma, inc, ecc, raan, argp]`
@@ -171,15 +172,41 @@ differential_evolution(
 )
 ```
 
+**Objective: conjunction margin.** `_mission_objective` returns the negated
+closest-approach distance in metres, so minimising the score maximises clearance
+between the mission orbit and the nearest catalog object.
+
+It was terminal eccentricity until measurements showed that was meaningless. A
+circular LEO orbit under J2 develops short-period eccentricity oscillation of
+amplitude ~1e-3 — the same order as the entire `[0, ecc_max]` search range — so
+the score tracked the phase of that oscillation at an arbitrary stopping time.
+Measured on a 550 km SSO, the initial eccentricity that scored "best" moved with
+mission duration (0.0008 at 12 h, 0.0010 at 2 d, 0.0 at 5 d, 0.0002 at 10 d),
+`argp`/`sma` phase outweighed the decision variable 2.1x, and `raan` — the
+parameter that decides which traffic you fly through — had exactly zero
+influence. Eccentricity was already bounded by `ecc_max` in the goal
+constructors, so constraining it twice bought nothing.
+
+Margin makes `sma`, `raan` and `argp` real decisions and grades safety rather
+than gating it: 5.1 km and 500 km of clearance used to tie. On a synthetic
+mid-band object, a plain band-centre orbit clears 7.1 km — nominally "safe" —
+while the optimizer finds 13,761 km by moving to a plane where the object sits
+on the far side of Earth.
+
 **Batch fitness function pattern:**
 ```python
-def batch_fitness(population):           # shape (N, 5) Keplerian params
-    states = keplerian_to_cartesian(population)          # (N, 6) ECI
-    finals = oi.propagate_batch_final(states, dt, n_steps)  # (N, 6) — OpenMP inside
-    scores = np.full(N, 1e10)
-    for i, state in enumerate(states):
-        if not check_conjunctions(state, epoch, duration, catalog, catalog_cache=cache):
-            scores[i] = mission_objective(finals[i])
+def batch_fitness(population):        # scipy hands over (n_params, S) — transpose it
+    population = population.T
+    scores = np.full(len(population), 1e10)
+    keep = [screen.check_pre_propagation(*row, n_steps=n_steps, dt=dt)[0]
+            for row in population]                        # O(1), no integrator
+    states = keplerian_to_cartesian(population[keep])
+    for j, i in enumerate(np.flatnonzero(keep)):
+        near = nearest_approach(states[j], epoch, duration, catalog,
+                                dt=dt, catalog_cache=cache)   # margin AND gate
+        if near is not None and near.min_separation_m < threshold_m:
+            continue                                       # unsafe → keep 1e10
+        scores[i] = _mission_objective(near)                # -margin, metres
     return scores
 ```
 
@@ -187,7 +214,7 @@ def batch_fitness(population):           # shape (N, 5) Keplerian params
 
 | Component | Per generation |
 |-----------|---------------|
-| `propagate_batch_final` (75 candidates, OpenMP) | ~70 ms |
+| Mission propagation (75 candidates, one `propagate_single` each) | ~70 ms |
 | Conjunction numpy separation (cached catalog) | ~2 s |
 | **Total** | **~2 s** |
 | 500 generations | **~17 min** |
@@ -254,7 +281,7 @@ fixed en route: `scipy` had been pip-installed over the conda-forge package.
 - [x] `tests/test_constraint_solver.py` — 17 tests: bounds validation, SSO inclination vs. known altitudes and drift rate, per-goal-constructor bands, custom roundtrip
 
 ### Phase 3b — Physics Agreement Layer ✓ (15/15 tests passing)
-- [x] `physics/pre_propagation.py` — `OrbitScreen.check_pre_propagation`: perigee floor, apogee ceiling, integration window vs. orbital period. O(1), no integrator call. **Wired into `batch_fitness`**, ahead of `propagate_batch_final`, so degenerate candidates reach neither the OpenMP kernel nor the conjunction check. Rejections are counted in `OptimizationResult.screened_out`.
+- [x] `physics/pre_propagation.py` — `OrbitScreen.check_pre_propagation`: perigee floor, apogee ceiling, integration window vs. orbital period. O(1), no integrator call. **Wired into `batch_fitness`**, ahead of any propagation, so degenerate candidates never reach the integrator or the conjunction check. Rejections are counted in `OptimizationResult.screened_out`.
 - [x] `physics/post_propagation.py` — `check_post_propagation` + `specific_energy` (2-body + J2). **Not wired in** — it is an accuracy evaluator for the experiment in the Roadmap, not a production gate.
 - [x] `tests/test_pre_propagation.py` (6) + `tests/test_post_propagation.py` (9)
 - With bounds from the goal constructors the screen normally rejects nothing; it earns its place on `custom()` bounds and on missions shorter than one orbital period, where conjunction screening would cover only part of a revolution.
@@ -280,12 +307,19 @@ fixed en route: `scipy` had been pip-installed over the conda-forge package.
 None of the following exists in the pipeline. Do not describe any of it as implemented.
 
 ### Optimizer objectives
-`_mission_objective` scores **terminal eccentricity only**, and its docstring contradicts
-itself (claims energy-deviation, computes eccentricity). For a sun-synchronous run with
-`ecc_max=0.001` the search is close to degenerate. Intended objectives:
-- Delta-v minimization (launch → operational orbit)
-- Coverage maximization
-- Time-to-orbit minimization
+The objective is conjunction margin (see Optimizer — Design Decisions). Still unbuilt:
+- **Per-goal-type objectives.** The original design took `run_optimizer(..., objective_fn)`;
+  the implementation hardcodes one. SSO, polar and rendezvous plausibly want different
+  scores — e.g. SSO drift fidelity, `|dΩ/dt − ω_sun|` measured from the propagation, which
+  would validate the constraint solver's analytic inclination against the real integrator.
+- **Coverage maximization** — needs ground-track → target-region → revisit machinery, and
+  the agent extracting a target region from the description.
+- **Delta-v minimization.** Noted for completeness, but launch delta-v for a circular LEO
+  is essentially analytic in altitude and inclination: it needs neither DE nor propagation,
+  and would just pin `sma` to its lower bound.
+- **Restore OpenMP batching.** Each candidate now propagates once inside `nearest_approach`.
+  Feeding batched trajectories into the conjunction layer would let `propagate_batch_final`
+  do that work in one OpenMP call instead of S serial ones.
 
 ### Output composer
 `format_report` emits elements, one safety boolean, and optimizer stats. Intended:

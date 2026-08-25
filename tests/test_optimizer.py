@@ -23,6 +23,7 @@ from optimizer.optimizer import (
     _mission_objective,
     run_optimizer,
 )
+from awareness.conjunction import ConjunctionResult
 from solver.constraint_solver import OrbitalBounds, R_EARTH, MU_EARTH
 
 EPOCH = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -83,42 +84,42 @@ def test_keplerian_to_cartesian_1d_input():
 
 
 # ---------------------------------------------------------------------------
-# Test 4: mission_objective — near-circular orbit scores near 0
+# Test 4/5: mission_objective — conjunction margin, lower score = more clearance
 # ---------------------------------------------------------------------------
-def test_mission_objective_circular():
-    a = R_EARTH + 500e3
-    elements = np.array([[a, np.radians(45.0), 0.0, 0.0, 0.0]])
-    state = keplerian_to_cartesian(elements)[0]
-
-    # Propagate one orbit
-    T = 2.0 * np.pi * np.sqrt(a ** 3 / MU_EARTH)
-    dt = 30.0
-    n_steps = int(T / dt)
-    final = np.asarray(oi.propagate_single_final(state, dt, n_steps))
-
-    score = _mission_objective(final)
-    # Near-circular orbit should have eccentricity << 0.01
-    assert score < 0.01, f"Circular orbit final eccentricity {score:.6f} should be < 0.01"
-
-
-# ---------------------------------------------------------------------------
-# Test 5: mission_objective — eccentric orbit scores higher than circular
-# ---------------------------------------------------------------------------
-def test_mission_objective_eccentric_greater_than_circular():
-    a_circ = R_EARTH + 500e3
-    elements_circ = np.array([[a_circ, 0.0, 0.001, 0.0, 0.0]])
-    elements_ecc  = np.array([[a_circ, 0.0, 0.1,   0.0, 0.0]])
-
-    state_circ = keplerian_to_cartesian(elements_circ)[0]
-    state_ecc  = keplerian_to_cartesian(elements_ecc)[0]
-
-    score_circ = _mission_objective(state_circ)
-    score_ecc  = _mission_objective(state_ecc)
-
-    assert score_ecc > score_circ, (
-        f"Eccentric orbit ({score_ecc:.4f}) should score worse than "
-        f"circular ({score_circ:.4f})"
+def _result(sep_km: float) -> ConjunctionResult:
+    return ConjunctionResult(
+        norad_id="00001", name="TEST",
+        min_separation_m=sep_km * 1000.0,
+        time_of_closest_approach_s=0.0,
     )
+
+
+def test_mission_objective_is_negated_margin():
+    """The score is the margin, negated, in metres — DE minimises."""
+    assert _mission_objective(_result(47.5)) == pytest.approx(-47_500.0)
+
+
+def test_mission_objective_prefers_more_clearance():
+    """More margin must score strictly better.
+
+    The old objective gated safety instead of grading it: every candidate above
+    the 5 km threshold scored identically on separation, so 5.1 km and 500 km of
+    clearance were indistinguishable.
+    """
+    tight = _mission_objective(_result(5.1))
+    roomy = _mission_objective(_result(500.0))
+    assert roomy < tight, "500 km of clearance should beat 5.1 km"
+
+
+def test_mission_objective_empty_shell_beats_any_real_margin():
+    """No objects in the altitude band is the safest possible outcome.
+
+    It must outrank every finite margin — scoring it neutrally would rank an
+    empty shell *below* an orbit with traffic 50 km away.
+    """
+    empty = _mission_objective(None)
+    assert empty < _mission_objective(_result(2000.0))
+    assert empty < 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +151,11 @@ def test_run_optimizer_empty_catalog():
 
     # With no catalog objects, every candidate is safe — optimizer should converge
     assert result.safe, "Best orbit should be safe with an empty catalog"
-    # Objective should be low (near-circular)
-    assert result.objective < 0.01, f"Objective {result.objective:.4f} should be near-circular"
+    # Nothing in the shell is the best possible margin, so the objective takes the
+    # empty-shell sentinel rather than any finite negated distance.
+    assert result.objective == pytest.approx(-1.0e9), (
+        f"empty catalog should score the empty-shell sentinel, got {result.objective}"
+    )
     # Elements should fall within bounds
     sma, inc, ecc, raan, argp = result.elements
     assert bounds.sma_min <= sma <= bounds.sma_max, "sma out of bounds"
@@ -296,3 +300,60 @@ def test_pre_propagation_screen_passes_valid_orbits():
 
     assert result.screened_out == 0, "well-formed candidates should not be screened out"
     assert result.conjunctions_checked > 0
+
+
+# ---------------------------------------------------------------------------
+# Test 10: the margin objective actually buys clearance
+# ---------------------------------------------------------------------------
+def test_optimizer_finds_more_clearance_than_an_arbitrary_orbit():
+    """The optimizer must beat a mid-band orbit on actual separation.
+
+    This is the property the old objective could not have: terminal eccentricity
+    was blind to raan entirely and gated separation at a threshold, so every safe
+    candidate tied. Margin makes clearance the thing being maximised.
+    """
+    from awareness.conjunction import CatalogCache, nearest_approach
+
+    # Column layout copied from tests/test_conjunction.py::_make_tle, which the
+    # altitude-filter tests already exercise — mean motion must land in cols 52-62.
+    a_obj = R_EARTH + 500e3          # a catalog object sitting mid-band
+    n_rev_day = np.sqrt(MU_EARTH / a_obj ** 3) * 86400.0 / (2.0 * np.pi)
+    line1 = ("1 99998U 25001A   25001.00000000  .00000000"
+             "  00000+0  00000+0 0  9990")
+    line2 = (f"2 99998  97.5000   0.0000 0000001  90.0000"
+             f" 270.0000 {n_rev_day:11.8f}    10")
+    catalog = [("MIDBAND_SAT", line1, line2)]
+
+    bounds = OrbitalBounds(
+        sma_min=R_EARTH + 480e3,
+        sma_max=R_EARTH + 520e3,
+        inc_min=np.radians(97.0),
+        inc_max=np.radians(98.0),
+        ecc_min=0.0,
+        ecc_max=0.002,
+    )
+
+    duration_s, dt = 7200.0, 60.0
+    result = run_optimizer(
+        bounds=bounds, epoch=EPOCH, duration_s=duration_s, catalog=catalog,
+        dt=dt, popsize=8, maxiter=25, seed=3,
+    )
+
+    # Margin of a plain mid-band orbit, for comparison.
+    baseline_state = keplerian_to_cartesian(
+        np.array([[bounds.sma_center, bounds.inc_center, 0.0, 0.0, 0.0]])
+    )[0]
+    baseline = nearest_approach(
+        baseline_state, EPOCH, duration_s, catalog, dt=dt,
+        catalog_cache=CatalogCache(),
+    )
+
+    assert result.nearest is not None, "the object should have been screened"
+    assert baseline is not None
+
+    assert result.nearest.min_separation_m > baseline.min_separation_m, (
+        f"optimizer margin {result.nearest.min_separation_m / 1e3:.1f} km did not "
+        f"beat a mid-band orbit's {baseline.min_separation_m / 1e3:.1f} km"
+    )
+    # And the score must be exactly the negated margin it reports.
+    assert result.objective == pytest.approx(-result.nearest.min_separation_m)
