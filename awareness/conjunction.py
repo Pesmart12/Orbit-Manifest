@@ -235,6 +235,8 @@ class CatalogCache:
         use_gpu: bool | None = None,
     ) -> None:
         self._store: dict = {}
+        self._satrecs: dict = {}   # same keys as _store; used by the fine stage
+        self._pending_key = None   # set by get_or_compute around a _compute call
         self.bucket_m   = bucket_m
         self._warn_bytes = warn_bytes
         self._nbytes    = 0      # cumulative across every entry held
@@ -261,11 +263,26 @@ class CatalogCache:
         The radius is snapped to the bucket grid so nearby candidates share an
         entry; the bucket's band is widened to compensate. See the class docstring.
         """
-        bucket = round(target_sma_m / self.bucket_m) * self.bucket_m
-        key = (epoch.isoformat(), duration_s, dt, bucket)
+        key = self._key(epoch, duration_s, dt, target_sma_m)
         if key not in self._store:
+            self._pending_key = key
+            bucket = round(target_sma_m / self.bucket_m) * self.bucket_m
             self._store[key] = self._compute(catalog, epoch, duration_s, dt, bucket)
         return self._store[key]
+
+    def _key(self, epoch: datetime, duration_s: float, dt: float, target_sma_m: float):
+        bucket = round(target_sma_m / self.bucket_m) * self.bucket_m
+        return (epoch.isoformat(), duration_s, dt, bucket)
+
+    def satrecs_for(self, epoch: datetime, duration_s: float, dt: float,
+                    target_sma_m: float) -> list:
+        """Satrec objects for a bucket, in the same order as its position array.
+
+        The fine refinement stage re-propagates individual objects at times that
+        are not on the coarse grid, which SatrecArray's shared-time-vector call
+        cannot express.
+        """
+        return self._satrecs.get(self._key(epoch, duration_s, dt, target_sma_m), [])
 
     def _compute(
         self,
@@ -287,6 +304,9 @@ class CatalogCache:
         satrec_list = [Satrec.twoline2rv(t[1], t[2]) for t in filtered]
         norad_ids   = [str(s.satnum) for s in satrec_list]
         sats        = SatrecArray(satrec_list)
+        # Kept so the fine stage can re-propagate individual objects at their own
+        # close-approach times; see _refine_candidates.
+        self._satrecs[self._pending_key] = satrec_list
 
         n_steps = int(duration_s / dt)
         T, N    = n_steps + 1, len(filtered)
@@ -337,6 +357,7 @@ def check_conjunctions(
     dt: float = 30.0,
     threshold_m: float = 5000.0,
     catalog_cache: CatalogCache | None = None,
+    refine: bool = False,
 ) -> list[ConjunctionResult]:
     """
     Check mission orbit against TLE catalog for conjunctions.
@@ -380,6 +401,12 @@ def check_conjunctions(
     min_sep, tca_s = _closest_approaches(
         mission_state, catalog_pos, dt, n_steps
     )
+    if refine:
+        min_sep, tca_s = _refine_candidates(
+            mission_state, cache.satrecs_for(epoch, duration_s, dt, target_sma_m),
+            epoch, duration_s, dt, min_sep, tca_s,
+            gate_m=_refine_gate(dt, threshold_m, target_sma_m),
+        )
 
     hits = np.where(min_sep < threshold_m)[0]
     results = [
@@ -445,10 +472,137 @@ def _closest_approaches(
         best_idx = xp.where(better, idx + s, best_idx)
         best     = xp.where(better, val, best)
 
-    min_sep = xp.sqrt(best)                    # compare squared, sqrt once at the end
+    # ---- sub-sample refinement -------------------------------------------
+    # The true closest approach almost never lands on a sample, so `best` is an
+    # OVERestimate. Measured against a dt=2 s reference on the live catalog, the
+    # dt=60 s grid overstated real miss distances by 1.6 km at the median but by
+    # up to 331 km in the tail — one object 8.8 km away was reported at 120 km,
+    # which for a 5 km threshold is a false negative waiting to happen.
+    #
+    # For a near-linear relative pass, squared distance is *exactly* quadratic in
+    # time: d²(t) = d_min² + v_rel²·(t − t*)². Over one LEO sample step the motion
+    # is close enough to linear that fitting a parabola through the three samples
+    # around the coarse minimum recovers both the true miss distance and its time,
+    # using data already in hand — no re-propagation.
+    cols  = xp.arange(N)
+    i_prev = xp.clip(best_idx - 1, 0, T - 1)
+    i_next = xp.clip(best_idx + 1, 0, T - 1)
+
+    def _d2_at(idx):
+        d = catalog_pos[idx, cols] - mission_pos[idx]     # (N, 3) gather
+        return (d * d).sum(axis=1)
+
+    y0, y1, y2 = _d2_at(i_prev), best, _d2_at(i_next)
+
+    # Vertex of the parabola through (-1, y0), (0, y1), (1, y2), in units of dt.
+    denom = y0 - 2.0 * y1 + y2
+    delta = xp.where(denom > 0.0, 0.5 * (y0 - y2) / xp.where(denom > 0.0, denom, 1.0), 0.0)
+    # Reject a fit that is flat, non-convex, or points outside the bracketing
+    # samples — and never let refinement land on the array edges, where one of the
+    # three points is a clamped duplicate.
+    ok = (
+        (denom > 0.0)
+        & (xp.abs(delta) <= 1.0)
+        & (best_idx > 0)
+        & (best_idx < T - 1)
+        & xp.isfinite(y0) & xp.isfinite(y2)
+    )
+    d2_ref = y1 - 0.25 * (y0 - y2) * delta
+    # A parabola through noisy samples can dip below zero; clamp before the sqrt.
+    d2_ref = xp.where(ok, xp.maximum(d2_ref, 0.0), y1)
+    t_ref  = (best_idx + xp.where(ok, delta, 0.0)) * dt
+
+    min_sep = xp.sqrt(d2_ref)
     if xp is not np:
-        min_sep, best_idx = _cp.asnumpy(min_sep), _cp.asnumpy(best_idx)
-    return min_sep, best_idx * dt              # step index → seconds after epoch
+        min_sep, t_ref = _cp.asnumpy(min_sep), _cp.asnumpy(t_ref)
+    return min_sep, t_ref
+
+
+def _refine_candidates(
+    mission_state: np.ndarray,
+    satrecs: list,
+    epoch: datetime,
+    duration_s: float,
+    dt: float,
+    min_sep: np.ndarray,
+    tca_s: np.ndarray,
+    gate_m: float,
+    fine_dt: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Re-measure objects near the gate on a fine time grid around their approach.
+
+    The coarse grid overstates miss distances, badly in the tail: measured against
+    a 1 s reference, dt=60 s reported an object 4.0 km away as 43.5 km, and picked
+    the wrong satellite as the closest in the whole run. Parabolic interpolation
+    fixes the median but not this — it assumes locally linear relative motion, and
+    at 15 km/s a 60 s step spans 900 km, some 15 degrees of orbital arc.
+
+    Sampling everything at dt=10 s would fix it and cost a 7 GB cache entry, too
+    large to hold two buckets in 12 GB of VRAM. Instead only the objects that could
+    possibly matter are re-measured: `gate_m` is a rigorous bound, so anything
+    excluded provably cannot reach the threshold. On the live catalog that is ~7%
+    of the band.
+
+    The mission trajectory is propagated once at `fine_dt` and shared by every
+    candidate; each object is then SGP4'd at the times in its own window.
+
+    **Off by default, because it is incomplete.** It refines around the coarse
+    argmin, which fixes mis-MEASUREMENT of an event but not mis-IDENTIFICATION of
+    which event matters. Measured on the live catalog, NORAD 63352's true closest
+    approach (4,005 m at T+2.897 h) is 2,861 s away from the approach the coarse
+    grid picked (43,062 m at T+2.102 h) — far outside any sane window. It lifts
+    p95 error from 1,068 m to 80 m for 6.6x the runtime and still names the wrong
+    nearest object. See Roadmap for the multi-level sieve that would fix it.
+    """
+    cand = np.flatnonzero(np.asarray(min_sep) < gate_m)
+    if cand.size == 0 or not satrecs:
+        return min_sep, tca_s
+
+    min_sep, tca_s = np.array(min_sep, copy=True), np.array(tca_s, copy=True)
+
+    n_fine = int(duration_s / fine_dt)
+    mission_fine = np.asarray(
+        oi.propagate_single(mission_state, fine_dt, n_fine)
+    )[:, :3]
+
+    # Julian dates for the whole fine grid, built once.
+    jd0, fr0 = _to_jday(epoch)
+
+    for j in cand:
+        lo = max(0.0, float(tca_s[j]) - dt)
+        hi = min(duration_s, float(tca_s[j]) + dt)
+        i0, i1 = int(lo / fine_dt), min(int(hi / fine_dt) + 1, len(mission_fine))
+        if i1 <= i0:
+            continue
+        t = np.arange(i0, i1) * fine_dt
+
+        fr = fr0 + t / 86400.0
+        jd = np.full(t.shape, jd0)
+        e, r, _ = satrecs[j].sgp4_array(jd, fr)
+        pos = np.asarray(r, dtype=np.float64) * 1000.0
+        pos[np.asarray(e) != 0] = np.inf
+
+        d = pos - mission_fine[i0:i1]
+        d2 = (d * d).sum(axis=1)
+        k = int(np.argmin(d2))
+        if d2[k] < min_sep[j] ** 2:
+            min_sep[j] = float(np.sqrt(d2[k]))
+            tca_s[j] = float(t[k])
+
+    return min_sep, tca_s
+
+
+def _refine_gate(dt: float, threshold_m: float, target_sma_m: float) -> float:
+    """Coarse separations below this could still hide a real threshold violation.
+
+    If the true closest approach happens at t*, the nearest sample is within dt/2
+    of it, so the coarse minimum can exceed the true one by at most v_rel·dt/2.
+    Bounding v_rel by two circular velocities at this radius (a head-on pass, the
+    worst case) makes the gate rigorous: anything above it provably cannot reach
+    threshold_m, so skipping it cannot hide a conjunction.
+    """
+    v_circ = float(np.sqrt(MU_EARTH / max(target_sma_m, R_EARTH)))
+    return threshold_m + 2.0 * v_circ * dt / 2.0
 
 
 def nearest_approach(
@@ -458,6 +612,7 @@ def nearest_approach(
     catalog: list[tuple[str, str, str]],
     dt: float = 30.0,
     catalog_cache: CatalogCache | None = None,
+    refine: bool = False,
 ) -> ConjunctionResult | None:
     """Closest catalog object over the window, **regardless of any threshold**.
 
@@ -485,6 +640,13 @@ def nearest_approach(
         return None
 
     min_sep, tca_s = _closest_approaches(mission_state, catalog_pos, dt, n_steps)
+    if refine:
+        # Gate on the current best: only objects that could beat it need re-measuring.
+        min_sep, tca_s = _refine_candidates(
+            mission_state, cache.satrecs_for(epoch, duration_s, dt, target_sma_m),
+            epoch, duration_s, dt, min_sep, tca_s,
+            gate_m=_refine_gate(dt, float(np.min(min_sep)), target_sma_m),
+        )
     i = int(np.argmin(min_sep))
     return ConjunctionResult(
         norad_id=norad_ids[i],

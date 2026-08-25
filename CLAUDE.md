@@ -357,6 +357,38 @@ The objective is conjunction margin (see Optimizer — Design Decisions). Still 
   reshapes it again. Decide it as part of that work, or delete both batch functions and the
   OpenMP build dependency if separation never gets touched.
 
+### Conjunction time resolution — a live safety gap
+Separation is sampled every `dt` and the minimum over samples is reported. That
+overestimates the true miss distance, and the tail is dangerous. Measured against
+a dt=1 s reference on the live catalog at dt=60 s:
+
+| | coarse only | + parabola (now) |
+|---|---|---|
+| median overestimate | 1,576 m | **0 m** |
+| p95 | 47,695 m | 1,068 m |
+| worst | 331,316 m | 270,204 m |
+
+Parabolic sub-sample refinement is in and free — squared distance is exactly
+quadratic in time for a linear relative pass. It fixes the median completely.
+
+**It does not fix the tail, and the tail is the safety case.** NORAD 63352's true
+closest approach is 4,005 m at T+2.897 h; the dt=60 s grid reports 43,062 m at
+T+2.102 h — a *different event*, 2,861 s away. The grid is not mis-measuring one
+approach, it is picking the wrong one, so no amount of refinement around its
+argmin can recover the real figure. The optimizer is therefore choosing orbits
+against miss distances that can be an order of magnitude too generous.
+
+`_refine_candidates` (opt-in, `refine=True`) re-propagates gated objects around
+their coarse TCA. It lifts p95 from 1,068 m to 80 m for 6.6x the runtime and
+still names the wrong nearest object, which is why it is off by default.
+
+**The fix is a multi-level sieve**, not finer sampling everywhere: dt=10 s is
+accurate (p95 0 m, correct nearest) but needs a 7 GB cache entry, too large for
+two buckets in 12 GB of VRAM. Instead — pass 1 at dt=60 s over all N to gate on a
+generous bound; pass 2 at dt=10 s over only the ~7% that survive (≈480 MB); pass 3
+fine re-propagation on what remains. Each stage must gate on `_refine_gate`'s
+rigorous v_rel·dt/2 bound so nothing that could reach the threshold is dropped.
+
 ### Conjunction separation performance
 Separation is ~100% of a generation (see Performance) and the only worthwhile optimization
 target. Agreed order of operations:

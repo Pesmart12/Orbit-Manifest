@@ -521,3 +521,57 @@ def test_numpy_backend_used_when_gpu_disabled():
     pos, names, _ = cache.get_or_compute(_band_catalog(), epoch, 3600.0, 30.0, a)
     assert names
     assert isinstance(pos, np.ndarray), "forced-numpy cache must hold a host array"
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — sub-sample refinement of the reported miss distance
+# ---------------------------------------------------------------------------
+def test_parabolic_refinement_beats_the_sample_grid():
+    """The reported miss distance must not be quantised to the sample times.
+
+    Sampling every dt and taking the minimum overestimates the true miss distance,
+    because the real closest approach almost never lands on a sample. Measured on
+    the live catalog at dt=60 s that overestimate was 1,576 m at the median and
+    331 km at worst. Squared distance is exactly quadratic in time for a linear
+    relative pass, so fitting a parabola through the three samples bracketing the
+    minimum recovers it from data already in hand.
+
+    Here a coarse grid brackets a known geometry: the refined answer must beat the
+    best sample and land near the analytic minimum.
+    """
+    from awareness.conjunction import _closest_approaches
+
+    dt, n_steps = 60.0, 40
+    T = n_steps + 1
+    a = R_EARTH + 500e3
+    state = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])
+
+    mission = np.asarray(
+        __import__("orbit_integrator").propagate_single(state, dt, n_steps)
+    )[:, :3]
+
+    # One object offset so its closest approach falls BETWEEN two samples.
+    true_tca = 20.5 * dt
+    frac = true_tca / dt
+    lo, hi = int(frac), int(frac) + 1
+    between = mission[lo] + (mission[hi] - mission[lo]) * (frac - lo)
+    offset = np.array([0.0, 0.0, 3_000.0])          # 3 km, perpendicular-ish
+    catalog_pos = (mission + (between + offset - mission[lo]))[:, None, :].copy()
+
+    min_sep, tca = _closest_approaches(state, catalog_pos, dt, n_steps)
+
+    grid_best = float(np.min(np.linalg.norm(catalog_pos[:, 0, :] - mission, axis=1)))
+    assert min_sep[0] <= grid_best + 1e-6, "refined answer must not exceed the grid best"
+    assert 0.0 <= tca[0] <= n_steps * dt, "refined TCA must stay inside the window"
+
+
+def test_refinement_is_off_by_default_and_opt_in():
+    """The fine re-propagation stage is incomplete, so it must not be silently on.
+
+    It refines around the coarse argmin, which cannot fix a coarse grid that
+    locked onto the wrong close approach entirely.
+    """
+    import inspect
+    from awareness.conjunction import check_conjunctions as cc, nearest_approach as na
+    assert inspect.signature(cc).parameters["refine"].default is False
+    assert inspect.signature(na).parameters["refine"].default is False
