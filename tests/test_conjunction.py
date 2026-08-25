@@ -17,6 +17,8 @@ import pytest
 from awareness.tle_fetcher import _parse, fetch_tles
 from awareness.conjunction import (
     CatalogCache,
+    nearest_approach,
+    screened_count,
     ConjunctionResult,
     _FILTER_BAND_M,
     _compute_catalog_positions,
@@ -295,3 +297,63 @@ def test_catalog_cache_budget_is_cumulative():
 
     assert cache.nbytes > 1_000
     assert len(cache._store) > 1, "budget should be exceeded by accumulation, not one entry"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — nearest_approach / screened_count: detail that check_conjunctions drops
+# ---------------------------------------------------------------------------
+def test_nearest_approach_reports_object_above_threshold():
+    """The closest object is reported even when nothing violates the threshold.
+
+    check_conjunctions answers "is anything too close?" and returns [] when the
+    answer is no, which leaves a SAFE verdict with no margin behind it. This is
+    the query that gives the report a number.
+    """
+    a      = R_EARTH + 400e3
+    v_circ = np.sqrt(MU_EARTH / a)
+    epoch  = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    state  = np.array([a, 0.0, 0.0, 0.0, 0.0, v_circ])
+
+    cache = CatalogCache()
+    hits = check_conjunctions(state, epoch, 3600.0, [ISS_TLE], dt=30.0,
+                              threshold_m=5000.0, catalog_cache=cache)
+    near = nearest_approach(state, epoch, 3600.0, [ISS_TLE], dt=30.0,
+                            catalog_cache=cache)
+
+    assert near is not None, "nearest object should be reported regardless of threshold"
+    assert near.name == "ISS (ZARYA)"
+    assert near.min_separation_m > 0.0
+    assert 0.0 <= near.time_of_closest_approach_s <= 3600.0
+
+    # The whole point: silent threshold check, but the detail still exists.
+    if not hits:
+        assert near.min_separation_m >= 5000.0
+
+
+def test_nearest_approach_empty_and_out_of_band():
+    epoch = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    a     = R_EARTH + 400e3
+    state = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])
+
+    assert nearest_approach(state, epoch, 3600.0, [], dt=30.0) is None
+    # An object 500 km above the band never survives the altitude filter.
+    far = _make_tle(900.0, 13001)
+    assert nearest_approach(state, epoch, 3600.0, [far], dt=30.0) is None
+
+
+def test_screened_count_is_the_filtered_subset():
+    """Screened count must reflect the altitude band, not the whole catalog."""
+    epoch = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    a     = R_EARTH + 500e3
+    state = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])
+
+    catalog = [
+        _make_tle(500.0, 13101),   # in band
+        _make_tle(505.0, 13102),   # in band
+        _make_tle(1200.0, 13103),  # far above — filtered out
+        _make_tle(300.0, 13104),   # far below — filtered out
+    ]
+
+    n = screened_count(state, epoch, 3600.0, catalog, dt=30.0)
+    assert 0 < n < len(catalog), f"expected a strict subset of {len(catalog)}, got {n}"
+    assert screened_count(state, epoch, 3600.0, [], dt=30.0) == 0

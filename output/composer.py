@@ -16,14 +16,13 @@ from pathlib import Path
 import numpy as np
 
 from agent.agent import MissionPlan
-from solver.constraint_solver import MU_EARTH, R_EARTH
+from physics.constants import MU_EARTH, OMEGA_EARTH, R_EARTH
 
 try:
     import orbit_integrator
 except ImportError:
     orbit_integrator = None  # type: ignore  — build with: pip install -e .
 
-_OMEGA_EARTH = 7.2921150e-5   # rad/s — Earth's rotation rate
 _WIDTH = 62
 _BAR = "─" * _WIDTH
 
@@ -55,7 +54,7 @@ def _eci_to_latlon(
     N = len(positions)
     t = np.arange(N) * dt
     gmst0 = _gmst_rad(epoch)
-    theta = gmst0 + _OMEGA_EARTH * t   # Earth rotation angle at each step
+    theta = gmst0 + OMEGA_EARTH * t   # Earth rotation angle at each step
 
     x, y, z = positions[:, 0], positions[:, 1], positions[:, 2]
     r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
@@ -106,6 +105,50 @@ def _split_at_wraps(
     breaks = np.where(np.abs(np.diff(lon)) > 180.0)[0] + 1
     idx = np.concatenate([[0], breaks, [len(lon)]])
     return [(lon[idx[i] : idx[i + 1]], lat[idx[i] : idx[i + 1]]) for i in range(len(idx) - 1)]
+
+
+def _format_duration(seconds: float) -> str:
+    """Seconds after epoch as a human-readable offset, e.g. '2 d 03:14'."""
+    total = int(round(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    return f"{days} d {hours:02d}:{minutes:02d}" if days else f"{hours:02d}:{minutes:02d}"
+
+
+def _conjunction_detail(plan: MissionPlan) -> list[str]:
+    """Report the closest approach, and list any threshold violations.
+
+    A bare 'SAFE' says nothing about margin — 6 km clear and 600 km clear read
+    identically. The optimizer already computes this detail for its final check,
+    so surfacing it costs nothing.
+    """
+    result = plan.result
+    lines: list[str] = []
+
+    nearest = result.nearest
+    if nearest is not None:
+        lines += [
+            "",
+            f"  Closest approach:  {nearest.min_separation_m / 1000.0:>10.2f} km",
+            f"    object:          {nearest.name} (NORAD {nearest.norad_id})",
+            f"    at:              T+{_format_duration(nearest.time_of_closest_approach_s)}",
+        ]
+    elif result.catalog_screened == 0:
+        lines += ["", "  No catalog objects crossed the mission altitude band."]
+
+    if result.conjunctions:
+        lines += ["", f"  Objects within threshold ({len(result.conjunctions)}):"]
+        for c in result.conjunctions[:10]:
+            lines.append(
+                f"    {c.min_separation_m / 1000.0:>8.2f} km  "
+                f"T+{_format_duration(c.time_of_closest_approach_s):<10}  "
+                f"{c.name} (NORAD {c.norad_id})"
+            )
+        if len(result.conjunctions) > 10:
+            lines.append(f"    … and {len(result.conjunctions) - 10} more")
+
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +202,11 @@ def format_report(plan: MissionPlan, epoch: datetime | None = None) -> str:
         "  CONJUNCTION SAFETY",
         _BAR,
         f"  Catalog size:      {plan.catalog_size:>10,} objects",
+        # Only objects whose orbit crosses the mission shell are ever propagated;
+        # quoting the full catalog alone overstates what was actually checked.
+        f"  Screened:          {plan.result.catalog_screened:>10,} objects in the altitude band",
         f"  Safety status:     {safety_str}",
+        *_conjunction_detail(plan),
         "",
         _BAR,
         "  OPTIMIZER STATISTICS",

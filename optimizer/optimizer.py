@@ -21,11 +21,16 @@ import numpy as np
 from scipy.optimize import differential_evolution
 
 import orbit_integrator as oi
-from awareness.conjunction import CatalogCache, check_conjunctions
+from awareness.conjunction import (
+    CatalogCache,
+    check_conjunctions,
+    nearest_approach,
+    screened_count,
+)
 from physics.pre_propagation import OrbitScreen
 from solver.constraint_solver import OrbitalBounds
 
-MU_EARTH = 3.986004418e14  # m³/s²
+from physics.constants import MU_EARTH
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +130,11 @@ class OptimizationResult:
     message: str = ""
     safe: bool = True             # False if best candidate still has conjunctions
     screened_out: int = 0         # candidates rejected by the pre-propagation screen
+    # Conjunction detail for the winning orbit. Previously all of this was computed
+    # for the final safety check and then discarded down to `safe`.
+    conjunctions: list = field(default_factory=list)  # ConjunctionResult below threshold
+    nearest: object | None = None      # ConjunctionResult for the closest object, any distance
+    catalog_screened: int = 0          # objects that survived the altitude filter
 
 
 # ---------------------------------------------------------------------------
@@ -271,4 +281,15 @@ def run_optimizer(
         message=result.message,
         safe=len(final_hits) == 0,
         screened_out=stats["screened_out"],
+        # Keep the detail rather than collapsing it to a bool. Both calls below
+        # hit the same cache entry the final check just used, so they are ~free.
+        conjunctions=final_hits,
+        nearest=nearest_approach(
+            best_state, epoch, duration_s, catalog,
+            dt=dt, catalog_cache=catalog_cache,
+        ),
+        catalog_screened=screened_count(
+            best_state, epoch, duration_s, catalog,
+            dt=dt, catalog_cache=catalog_cache,
+        ),
     )

@@ -300,3 +300,66 @@ def test_plot_ground_track_saves_file(tmp_path: Path):
     assert out_file.exists()
     assert out_file.stat().st_size > 0
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Conjunction detail in the report — previously computed then discarded
+# ---------------------------------------------------------------------------
+
+
+def _plan_with_conjunctions(hits=(), nearest=None, screened=1234) -> MissionPlan:
+    from awareness.conjunction import ConjunctionResult  # noqa: F401  (kept local)
+    plan = _make_plan(safe=not hits)
+    plan.result.conjunctions = list(hits)
+    plan.result.nearest = nearest
+    plan.result.catalog_screened = screened
+    return plan
+
+
+def _hit(name, norad, km, t_s):
+    from awareness.conjunction import ConjunctionResult
+    return ConjunctionResult(
+        norad_id=norad, name=name,
+        min_separation_m=km * 1000.0,
+        time_of_closest_approach_s=t_s,
+    )
+
+
+def test_report_distinguishes_screened_from_catalog_size():
+    """Quoting the full catalog beside the verdict overstates what was checked."""
+    plan = _plan_with_conjunctions(nearest=_hit("SOMESAT", "12345", 47.5, 3600.0),
+                                   screened=1234)
+    report = format_report(plan, epoch=_EPOCH)
+
+    assert "Screened:" in report
+    assert "1,234" in report, "screened subset should be reported"
+    assert f"{plan.catalog_size:,}" in report, "full catalog size should still appear"
+    assert plan.catalog_size != 1234, "fixture must make the two numbers distinguishable"
+
+
+def test_report_quantifies_a_safe_verdict():
+    """SAFE should carry a margin — 6 km clear and 600 km clear must not read alike."""
+    plan = _plan_with_conjunctions(nearest=_hit("SOMESAT", "12345", 47.5, 90061.0))
+    report = format_report(plan, epoch=_EPOCH)
+
+    assert "Closest approach:" in report
+    assert "47.50 km" in report
+    assert "SOMESAT" in report and "12345" in report
+    assert "T+1 d 01:01" in report, "TCA should be a readable offset"
+
+
+def test_report_lists_threshold_violations():
+    hits = [_hit("BAD-1", "111", 1.2, 60.0), _hit("BAD-2", "222", 3.4, 120.0)]
+    plan = _plan_with_conjunctions(hits=hits, nearest=hits[0])
+    report = format_report(plan, epoch=_EPOCH)
+
+    assert "CONJUNCTION RISK" in report
+    assert "Objects within threshold (2)" in report
+    assert "BAD-1" in report and "BAD-2" in report
+    assert "1.20 km" in report
+
+
+def test_report_handles_nothing_in_band():
+    plan = _plan_with_conjunctions(nearest=None, screened=0)
+    report = format_report(plan, epoch=_EPOCH)
+    assert "No catalog objects crossed" in report

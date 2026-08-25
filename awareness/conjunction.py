@@ -13,8 +13,7 @@ from sgp4.api import Satrec, SatrecArray, jday
 # elements are defined relative to the SGP4 model — not osculating elements.
 import orbit_integrator as oi
 
-MU_EARTH = 3.986004418e14  # m³/s²
-R_EARTH  = 6.3781e6        # m
+from physics.constants import MU_EARTH, R_EARTH
 
 # Full width of the altitude screening window around a candidate's radius.
 # _filter_by_altitude keeps objects overlapping ±_FILTER_BAND_M / 2.
@@ -290,20 +289,9 @@ def check_conjunctions(
     if N == 0:
         return []
 
-    # Propagate mission orbit with C++ RK4; extract positions only (columns 0-2).
-    # Shape: (T, 3) meters.  Velocities are not needed for separation computation.
-    mission_pos = np.asarray(oi.propagate_single(mission_state, dt, n_steps))[:, :3]
-
-    # Vectorized separation across all time steps and all catalog objects at once.
-    # mission_pos[:, None, :] inserts a size-1 axis at position 1, giving shape
-    # (T, 1, 3).  Subtracting from catalog_pos (T, N, 3) broadcasts to (T, N, 3).
-    # np.linalg.norm(..., axis=2) then reduces the xyz dimension → (T, N) distances.
-    diff = catalog_pos - mission_pos[:, None, :]
-    sep  = np.linalg.norm(diff, axis=2)  # (T, N)
-
-    min_sep = sep.min(axis=0)     # (N,) — closest approach per satellite across all T steps
-    tca_idx = sep.argmin(axis=0)  # (N,) — index of the time step where min occurred
-    tca_s   = tca_idx * dt        # (N,) — convert step index to seconds after epoch
+    min_sep, tca_s = _closest_approaches(
+        mission_state, catalog_pos, dt, n_steps
+    )
 
     hits = np.where(min_sep < threshold_m)[0]
     results = [
@@ -317,6 +305,101 @@ def check_conjunctions(
     ]
     results.sort(key=lambda r: r.min_separation_m)
     return results
+
+
+def _closest_approaches(
+    mission_state: np.ndarray,
+    catalog_pos: np.ndarray,
+    dt: float,
+    n_steps: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-object closest approach over the whole window.
+
+    Returns (min_sep (N,) metres, tca_s (N,) seconds after epoch). Shared by the
+    threshold check and the nearest-approach query so the separation maths exists
+    in exactly one place.
+    """
+    # Propagate mission orbit with C++ RK4; extract positions only (columns 0-2).
+    # Shape: (T, 3) meters.  Velocities are not needed for separation computation.
+    mission_pos = np.asarray(oi.propagate_single(mission_state, dt, n_steps))[:, :3]
+
+    # Vectorized separation across all time steps and all catalog objects at once.
+    # mission_pos[:, None, :] inserts a size-1 axis at position 1, giving shape
+    # (T, 1, 3).  Subtracting from catalog_pos (T, N, 3) broadcasts to (T, N, 3).
+    # np.linalg.norm(..., axis=2) then reduces the xyz dimension → (T, N) distances.
+    diff = catalog_pos - mission_pos[:, None, :]
+    sep  = np.linalg.norm(diff, axis=2)  # (T, N)
+
+    min_sep = sep.min(axis=0)     # (N,) — closest approach per satellite across all T steps
+    tca_idx = sep.argmin(axis=0)  # (N,) — index of the time step where min occurred
+    return min_sep, tca_idx * dt  # step index → seconds after epoch
+
+
+def nearest_approach(
+    mission_state: np.ndarray,
+    epoch: datetime,
+    duration_s: float,
+    catalog: list[tuple[str, str, str]],
+    dt: float = 30.0,
+    catalog_cache: CatalogCache | None = None,
+) -> ConjunctionResult | None:
+    """Closest catalog object over the window, **regardless of any threshold**.
+
+    `check_conjunctions` answers "is anything too close?" and returns nothing when
+    the answer is no. That makes a clean safety verdict unquantified — "SAFE" with
+    no number behind it. This answers "what was the closest thing?", so a report
+    can say how much margin the orbit actually had.
+
+    Returns None only when the catalog is empty or nothing survives the altitude
+    filter. Pass the optimizer's `catalog_cache` and this is nearly free: the
+    catalog positions are already computed.
+    """
+    if not catalog:
+        return None
+
+    epoch = epoch.replace(tzinfo=timezone.utc) if epoch.tzinfo is None else epoch
+    cache = catalog_cache if catalog_cache is not None else CatalogCache()
+    target_sma_m = float(np.linalg.norm(mission_state[:3]))
+    n_steps = int(duration_s / dt)
+
+    catalog_pos, names, norad_ids = cache.get_or_compute(
+        catalog, epoch, duration_s, dt, target_sma_m
+    )
+    if len(names) == 0:
+        return None
+
+    min_sep, tca_s = _closest_approaches(mission_state, catalog_pos, dt, n_steps)
+    i = int(np.argmin(min_sep))
+    return ConjunctionResult(
+        norad_id=norad_ids[i],
+        name=names[i],
+        min_separation_m=float(min_sep[i]),
+        time_of_closest_approach_s=float(tca_s[i]),
+    )
+
+
+def screened_count(
+    mission_state: np.ndarray,
+    epoch: datetime,
+    duration_s: float,
+    catalog: list[tuple[str, str, str]],
+    dt: float = 30.0,
+    catalog_cache: CatalogCache | None = None,
+) -> int:
+    """How many catalog objects actually got screened for this orbit.
+
+    The altitude pre-filter keeps only objects whose orbit crosses the mission
+    shell, so this is far smaller than len(catalog). Reporting the full catalog
+    size next to a safety verdict overstates what was checked.
+    """
+    if not catalog:
+        return 0
+    epoch = epoch.replace(tzinfo=timezone.utc) if epoch.tzinfo is None else epoch
+    cache = catalog_cache if catalog_cache is not None else CatalogCache()
+    _, names, _ = cache.get_or_compute(
+        catalog, epoch, duration_s, dt, float(np.linalg.norm(mission_state[:3]))
+    )
+    return len(names)
 
 
 def _to_jday(dt_utc: datetime) -> tuple[float, float]:

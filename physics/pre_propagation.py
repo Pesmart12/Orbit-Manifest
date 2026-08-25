@@ -13,10 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-# Mirror constants from integrator/integrator.h.
-# If you change these, change them in both other locations too.
-MU_EARTH = 3.986004418e14   # m^3/s^2
-R_EARTH  = 6.3781e6         # m
+from physics.constants import MU_EARTH, R_EARTH
 
 
 class OrbitScreen:

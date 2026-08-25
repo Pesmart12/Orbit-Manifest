@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-MU_EARTH = 3.986004418e14   # m^3/s^2
-R_EARTH  = 6.3781e6         # m
-J2       = 1.08263e-3       # dimensionless
+from physics.constants import J2, MU_EARTH, R_EARTH
 
 
 def specific_energy(s: np.ndarray) -> float:

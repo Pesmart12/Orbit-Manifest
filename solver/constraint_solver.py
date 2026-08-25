@@ -13,11 +13,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# Mirror the constants from the C++ integrator to keep unit checks consistent.
-# If you change these here, change them in integrator/integrator.h too.
-MU_EARTH = 3.986004418e14   # m^3/s^2  — Earth's gravitational parameter
-R_EARTH  = 6.3781e6         # m        — mean equatorial radius
-J2       = 1.08263e-3       # dimensionless — Earth's oblateness coefficient
+# Canonical constants live in physics/constants.py. Re-exported here because
+# callers and tests have long imported them from this module.
+from physics.constants import J2, MU_EARTH, R_EARTH
 
 # Earth's mean angular velocity around the Sun.
 # A sun-synchronous orbit's nodal drift must equal this value so the
