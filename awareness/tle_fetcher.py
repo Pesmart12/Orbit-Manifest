@@ -50,17 +50,43 @@ def fetch_tles(cache_ttl: float = TTL_SECONDS) -> list[tuple[str, str, str]]:
 
 
 def _download() -> list[tuple[str, str, str]]:
-    """Authenticate with Space-Track and pull the active LEO catalog."""
+    """Authenticate with Space-Track and pull the active LEO catalog.
+
+    Raises RuntimeError rather than returning an empty catalog. An empty catalog
+    is indistinguishable from "space is empty" to every caller downstream, and
+    the conjunction checker would happily declare any orbit safe.
+    """
     user = os.environ["SPACE_TRACK_USER"]
     pwd  = os.environ["SPACE_TRACK_PASS"]
 
     # A requests.Session keeps the auth cookie across the subsequent GET.
     s = requests.Session()
-    s.post(LOGIN_URL, data={"identity": user, "password": pwd}, timeout=30)
+    login = s.post(LOGIN_URL, data={"identity": user, "password": pwd}, timeout=30)
+
+    # The login response must be checked. Space-Track rejects a bad login with a
+    # 4xx and a JSON body, but leaves the session usable — the catalog query then
+    # answers 204 No Content, which raise_for_status() treats as SUCCESS because
+    # it is a 2xx. The old code skipped this check and cached the resulting empty
+    # catalog for 24 hours, so an auth failure looked like an empty sky.
+    if login.status_code != 200 or '"Login"' in login.text:
+        raise RuntimeError(
+            f"Space-Track login failed (HTTP {login.status_code}): "
+            f"{login.text[:200]}. Check SPACE_TRACK_USER / SPACE_TRACK_PASS in .env."
+        )
 
     resp = s.get(CATALOG_URL, timeout=60)
     resp.raise_for_status()  # surface HTTP errors (401 bad creds, 429 rate-limit, etc.)
-    return _parse(resp.text)
+
+    tles = _parse(resp.text)
+    if not tles:
+        # Covers 204 No Content and any 2xx whose body holds no parseable TLEs.
+        # Never let this reach the caller as a valid empty catalog.
+        raise RuntimeError(
+            f"Space-Track returned no usable TLEs (HTTP {resp.status_code}, "
+            f"{len(resp.text)} bytes). This usually means the session was not "
+            "authenticated, or the query matched nothing."
+        )
+    return tles
 
 
 def _parse(text: str) -> list[tuple[str, str, str]]:

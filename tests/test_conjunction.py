@@ -60,12 +60,16 @@ def _make_tle(alt_km: float, norad_id: int, ecc: float = 0.0001) -> tuple:
 
 
 def _make_mock_session(text: str) -> MagicMock:
-    mock_resp = MagicMock()
-    mock_resp.text = text
+    mock_resp = MagicMock(status_code=200, text=text)
     mock_resp.raise_for_status = MagicMock()
 
+    # A successful Space-Track login is HTTP 200 with no "Login" key in the body.
+    # The bare MagicMock this used to return had a MagicMock status_code, which
+    # modelled no real response and passed only because nothing checked it.
+    mock_login = MagicMock(status_code=200, text="")
+
     mock_session = MagicMock()
-    mock_session.post.return_value = MagicMock()
+    mock_session.post.return_value = mock_login
     mock_session.get.return_value = mock_resp
     return mock_session
 
@@ -357,3 +361,56 @@ def test_screened_count_is_the_filtered_subset():
     n = screened_count(state, epoch, 3600.0, catalog, dt=30.0)
     assert 0 < n < len(catalog), f"expected a strict subset of {len(catalog)}, got {n}"
     assert screened_count(state, epoch, 3600.0, [], dt=30.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — an auth failure must never look like an empty sky
+# ---------------------------------------------------------------------------
+def test_login_failure_raises_instead_of_caching_empty(tmp_path, monkeypatch):
+    """A rejected login must raise, not cache a 24-hour empty catalog.
+
+    Regression, found on the first live run: Space-Track answers a bad login with
+    401 but leaves the session usable, and the catalog query then returns 204 No
+    Content. raise_for_status() treats 204 as success because it is a 2xx, so
+    _parse("") returned [] and fetch_tles cached an empty catalog for a day. The
+    conjunction checker would then declare every orbit safe.
+    """
+    monkeypatch.setenv("SPACE_TRACK_USER", "u")
+    monkeypatch.setenv("SPACE_TRACK_PASS", "short")
+    cache_file = tmp_path / "tle_cache.json"
+    monkeypatch.setattr("awareness.tle_fetcher.CACHE_PATH", cache_file)
+
+    login = MagicMock(status_code=401,
+                      text='{"Login":"Password does not meet minimum length requirements."}')
+    query = MagicMock(status_code=204, text="")
+    query.raise_for_status = MagicMock()          # 204 is a 2xx — does not raise
+    session = MagicMock()
+    session.post.return_value = login
+    session.get.return_value = query
+
+    with patch("awareness.tle_fetcher.requests.Session", return_value=session):
+        with pytest.raises(RuntimeError, match="login failed"):
+            fetch_tles(cache_ttl=0)
+
+    assert not cache_file.exists(), "a failed login must not write a cache entry"
+
+
+def test_empty_catalog_body_raises_instead_of_caching(tmp_path, monkeypatch):
+    """Even with a clean login, a body holding no TLEs must not be cached."""
+    monkeypatch.setenv("SPACE_TRACK_USER", "u")
+    monkeypatch.setenv("SPACE_TRACK_PASS", "p")
+    cache_file = tmp_path / "tle_cache.json"
+    monkeypatch.setattr("awareness.tle_fetcher.CACHE_PATH", cache_file)
+
+    login = MagicMock(status_code=200, text="")
+    query = MagicMock(status_code=204, text="")
+    query.raise_for_status = MagicMock()
+    session = MagicMock()
+    session.post.return_value = login
+    session.get.return_value = query
+
+    with patch("awareness.tle_fetcher.requests.Session", return_value=session):
+        with pytest.raises(RuntimeError, match="no usable TLEs"):
+            fetch_tles(cache_ttl=0)
+
+    assert not cache_file.exists()
