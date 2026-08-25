@@ -34,7 +34,7 @@ pytest tests/
 
 # End-to-end run
 python run.py "7-day sun-synchronous Earth observation at 550 km" --quick   # fast pipeline check
-python run.py "7-day sun-synchronous Earth observation at 550 km"             # full run (~17 min)
+python run.py "7-day sun-synchronous Earth observation at 550 km"             # full run (duration depends on catalog density — see Performance)
 ```
 
 ---
@@ -116,7 +116,7 @@ const double OMEGA_EARTH = 7.2921150e-5;    // rad/s
 - **Optimizer uses `workers=1` with `updating='deferred'` and `vectorized=True`.** scipy overrides `vectorized` whenever `workers != 1`, so `workers=1` is a requirement of the vectorized contract, not merely a way to avoid fighting OpenMP. `updating='deferred'` is required to collect the full population before evaluating.
 - **The optimizer no longer batch-propagates.** Since the objective became conjunction margin, each candidate needs one mission propagation, and `nearest_approach` does it internally. The old loop propagated every candidate twice — once through `propagate_batch_final` for the eccentricity objective, once again inside `check_conjunctions`. `propagate_batch_final` remains part of the C++ API and is still validated by `tests/test_integrator.py`; feeding batched trajectories into the conjunction layer to restore OpenMP batching is an open optimization (see Roadmap).
 - **CatalogCache lives for the lifetime of an optimizer run.** Instantiate once before the optimization loop and pass it to every `check_conjunctions` call. Never create a new CatalogCache inside the fitness function.
-- **No PINN surrogate for the integrator.** The RK4 batch propagation (~70 ms/generation) is not the bottleneck — conjunction checking was (~37 s/generation). Approximating the integrator introduces position errors that could produce false-negative conjunction results, which is a safety failure.
+- **No PINN surrogate for the integrator.** Propagation is not the bottleneck — measured at 7.3 ms/generation batched against ~37 s for conjunction separation (see Performance). Approximating the integrator introduces position errors that could produce false-negative conjunction results, which is a safety failure.
 
 ---
 
@@ -146,7 +146,7 @@ The original conjunction checker looped over T time steps in Python, calling `Sa
 
 4. **Fully vectorized separation** in `check_conjunctions`: `(T, N, 3) - (T, 1, 3)` broadcast → `np.linalg.norm(axis=2)` → `(T, N)`. No Python loop over time steps.
 
-**Result:** ~37s/generation → ~2s/generation.
+**Result:** the catalog SGP4 propagation is now done once per altitude bucket instead of per candidate per generation. Note this removed *catalog propagation* from the hot path, not the per-candidate separation broadcast, which is unchanged and still dominates — see Performance.
 
 ---
 
@@ -210,14 +210,53 @@ def batch_fitness(population):        # scipy hands over (n_params, S) — trans
     return scores
 ```
 
-**Performance estimate (8-core machine, 7-day mission, 500 km orbit):**
+---
 
-| Component | Per generation |
-|-----------|---------------|
-| Mission propagation (75 candidates, one `propagate_single` each) | ~70 ms |
-| Conjunction numpy separation (cached catalog) | ~2 s |
-| **Total** | **~2 s** |
-| 500 generations | **~17 min** |
+## Performance — what is measured and what is not
+
+**No figure here has been checked against a real catalog.** The pipeline has never
+run against live Space-Track data; `data/tle_cache.json` has only ever held an
+empty list. Treat everything below as shape, not magnitude.
+
+**Measured** (2026-08-24, this machine, 7-day mission at dt=60 s → T=10,081 steps,
+population 75):
+
+| Component | Per generation | Notes |
+|---|---|---|
+| `propagate_batch` (OpenMP, whole population) | **7.3 ms** | no production caller — see Architecture Rules |
+| `propagate_single` × 75 (what the loop does today) | **34.7 ms** | serial, from Python |
+| Conjunction separation | **~493 ms × 75** | scales linearly with N — see below |
+
+Propagation is **0.02%** of a generation. Separation is effectively all of it, so
+the Amdahl ceiling from making propagation infinitely fast is 1.00x. Any
+optimization effort belongs in the separation path.
+
+**Everything hinges on N**, the object count surviving the altitude filter, which
+is the one number we do not have. Separation is memory-bandwidth-bound and linear
+in N, so:
+
+| Objects in band (N) | Per generation | 500 generations |
+|---|---|---|
+| 110 | ~2.0 s | ~17 min |
+| 500 | ~9.2 s | ~1.3 h |
+| 1,000 | ~18.5 s | ~2.6 h |
+| 2,000 | ~37 s | ~5.1 h |
+
+The previously documented "~2 s/generation, ~17 min" corresponds to N≈110. Either
+that came from a much narrower shell than the current filter produces, or it was
+never right. **Measuring the real N is the first thing a live run should settle.**
+
+Two known influences on N and on this cost:
+
+- `CatalogCache` bucketing widened the screening band from ±25 km to ±50 km so a
+  shared bucket entry stays a superset for every candidate in it. That roughly
+  doubles N, and therefore roughly doubles the dominant cost. `_BUCKET_M` is
+  tunable and was chosen by reasoning, not measurement.
+- The separation code allocates a `(T, N, 3)` temporary per candidate — 461 MB at
+  N=2,000. Chunking over time gives identical results at **2.1x** (493 → 235 ms),
+  and float32 would roughly halve bandwidth again at ~1 m resolution against a
+  5 km threshold. Both are free of new dependencies and worth taking before any
+  GPU work.
 
 ---
 
@@ -318,8 +357,30 @@ The objective is conjunction margin (see Optimizer — Design Decisions). Still 
   is essentially analytic in altitude and inclination: it needs neither DE nor propagation,
   and would just pin `sma` to its lower bound.
 - **Restore OpenMP batching.** Each candidate now propagates once inside `nearest_approach`.
-  Feeding batched trajectories into the conjunction layer would let `propagate_batch_final`
-  do that work in one OpenMP call instead of S serial ones.
+  Feeding batched trajectories into the conjunction layer would let `propagate_batch` do that
+  work in one OpenMP call instead of S serial ones. Deliberately deferred: it is a 0.02%
+  gain and would reshape the conjunction API immediately before the separation work
+  reshapes it again. Decide it as part of that work, or delete both batch functions and the
+  OpenMP build dependency if separation never gets touched.
+
+### Conjunction separation performance
+Separation is ~100% of a generation (see Performance) and the only worthwhile optimization
+target. Agreed order of operations:
+
+1. **Measure first.** A live Space-Track run settles N, which every estimate depends on, and
+   shows whether `_BUCKET_M` — which doubled the screening band — is hurting.
+2. **Take the free numpy wins.** Chunking over time is 2.1x with identical results; float32
+   roughly halves bandwidth again at ~1 m resolution against a 5 km threshold.
+3. **Consider an algorithmic pre-filter.** Excluding objects whose orbital planes cannot
+   bring them within the threshold, or a coarse-time pass refined near candidates, would cut
+   N directly and likely beat any hardware change.
+4. **Then GPU.** Pedro's stated preference (2026-08-24) is CUDA via **CuPy**. It is a good
+   fit: embarrassingly parallel over objects, bandwidth-bound, and `CatalogCache` already
+   holds the catalog array so it uploads once per bucket while each candidate transfers only
+   a 242 KB trajectory up and 16 KB of minima back. Build it as an optional import with the
+   numpy path as fallback — the project targets teams who may not have an NVIDIA card, and
+   keeping both lets them be diffed for correctness. Hardware here: RTX 4070, 12 GB,
+   compute 8.9; neither the CUDA toolkit nor CuPy is installed yet.
 
 ### Output composer
 `format_report` emits elements, one safety boolean, and optimizer stats. Intended:
