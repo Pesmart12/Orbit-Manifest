@@ -363,3 +363,24 @@ def test_report_handles_nothing_in_band():
     plan = _plan_with_conjunctions(nearest=None, screened=0)
     report = format_report(plan, epoch=_EPOCH)
     assert "No catalog objects crossed" in report
+
+
+def test_report_never_prints_the_empty_shell_sentinel_as_a_distance():
+    """An empty shell scores a sentinel, not a real margin.
+
+    Rendering it verbatim produced 'Objective (margin):1000000.00 km' — a million
+    kilometres, which is not a distance anyone measured.
+    """
+    plan = _plan_with_conjunctions(nearest=None, screened=0)
+    plan.result.objective = -1.0e9
+    report = format_report(plan, epoch=_EPOCH)
+
+    assert "1000000" not in report and "1,000,000" not in report
+    assert "no objects in band" in report
+
+
+def test_report_shows_margin_in_km_when_there_is_traffic():
+    plan = _plan_with_conjunctions(nearest=_hit("SOMESAT", "12345", 13761.4, 60.0))
+    plan.result.objective = -13_761_400.0
+    report = format_report(plan, epoch=_EPOCH)
+    assert "13,761.40 km" in report

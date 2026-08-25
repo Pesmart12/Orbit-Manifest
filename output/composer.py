@@ -116,6 +116,17 @@ def _format_duration(seconds: float) -> str:
     return f"{days} d {hours:02d}:{minutes:02d}" if days else f"{hours:02d}:{minutes:02d}"
 
 
+def _objective_str(plan: MissionPlan) -> str:
+    """The objective as a reader-facing clearance, not a raw internal score.
+
+    A candidate whose altitude shell holds no catalog objects scores a sentinel
+    rather than a real distance; printing that verbatim gives "1000000.00 km".
+    """
+    if plan.result.nearest is None:
+        return "no objects in band"
+    return f"{-plan.result.objective / 1000.0:,.2f} km"
+
+
 def _conjunction_detail(plan: MissionPlan) -> list[str]:
     """Report the closest approach, and list any threshold violations.
 
@@ -212,9 +223,10 @@ def format_report(plan: MissionPlan, epoch: datetime | None = None) -> str:
         "  OPTIMIZER STATISTICS",
         _BAR,
         f"  Converged:         {'Yes' if plan.result.success else 'No':>10}",
-        # The objective is negated conjunction margin in metres; report it as the
-        # positive clearance it represents rather than as a raw internal score.
-        f"  Objective (margin):{-plan.result.objective / 1000.0:>10.2f} km",
+        # The objective is negated conjunction margin in metres. Report the positive
+        # clearance it stands for — and never print the empty-shell sentinel as a
+        # distance, since 1e9 m renders as a meaningless "1000000.00 km".
+        f"  Objective (margin): {_objective_str(plan):>18}",
         f"  Generations:       {plan.result.n_generations:>10,}",
         f"  Conjunction calls: {plan.result.conjunctions_checked:>10,}",
         f"  Wall-clock time:   {plan.result.elapsed_s:>10.1f} s",
