@@ -370,7 +370,9 @@ magnitude too generous.
 grid. Level 2 re-measures the survivors **over the whole window again** at
 `dt / _SIEVE_FACTOR` — not around level 1's answer, which is the entire point.
 Promotion uses `_refine_gate`'s rigorous `v_rel·dt/2` bound, so nothing that could
-reach the gate is dropped, and only ~7% of the band is promoted.
+reach the gate is dropped. **Measured promotion rate over a 7-day window is 63.5%**
+(3,054 of 4,807), not the ~7% a 6-hour window suggested — over a week most objects
+drift within the gate at some point, so level 2 is now the dominant cost.
 
 | vs dt=1 s reference | coarse | + parabola | **sieve** |
 |---|---|---|---|
@@ -384,8 +386,20 @@ entry — too large for two buckets in 12 GB of VRAM. Gating first keeps level 2
 ~480 MB. Level-2 positions are cached per object, so the expensive fine SGP4 is
 paid once per object across a whole run rather than once per candidate orbit.
 
-**Cost of correctness:** 24 ms -> 136 ms per candidate, so a full run goes from
-~15 min to ~85 min, and the cache reaches ~5 GB. That is the right trade for a
+**Cost of correctness:** 24 ms -> 135 ms per candidate, so a full run goes from
+~15 min to ~85 min, and the cache reaches ~5 GB.
+
+**The GPU is what makes the sieve affordable at all** — measured on the same
+7-day case: CuPy 135 ms/candidate (1.4 h per run) against numpy 4,964 ms
+(51.7 h). Not an optimisation; a precondition.
+
+The obvious remaining lever is the promotion gate. `_refine_gate` bounds relative
+velocity by two circular velocities — a head-on retrograde pass — which is right
+for the worst case and far too generous for an SSO mission meeting other
+near-polar traffic. A per-object bound would cut the 63.5% promotion rate
+directly and is the cheapest large win left. Note the triangle-inequality form
+(|Δcatalog| + |Δmission|) reduces to the same head-on figure, so a useful bound
+has to use the actual relative motion, not per-body speeds. That is the right trade for a
 conjunction checker: the alternative is a fast answer that names the wrong
 satellite. Memory is now the binding constraint — a failed GPU upload warns and
 degrades to numpy rather than killing the run.

@@ -560,6 +560,15 @@ def _closest_approaches(
 
     y0, y1, y2 = _d2_at(i_prev), best, _d2_at(i_next)
 
+    # Decayed satellites and bad TLEs are marked with inf, so a neighbour sample
+    # can be inf and `inf - inf` yields NaN with a RuntimeWarning. The comparisons
+    # below already reject NaN (every one is False), so the result was correct —
+    # but relying on that is fragile and the warnings drown real ones. Replace
+    # non-finite neighbours with the centre sample, which disables the fit for
+    # that object explicitly.
+    y0 = xp.where(xp.isfinite(y0), y0, y1)
+    y2 = xp.where(xp.isfinite(y2), y2, y1)
+
     # Vertex of the parabola through (-1, y0), (0, y1), (1, y2), in units of dt.
     denom = y0 - 2.0 * y1 + y2
     delta = xp.where(denom > 0.0, 0.5 * (y0 - y2) / xp.where(denom > 0.0, denom, 1.0), 0.0)
