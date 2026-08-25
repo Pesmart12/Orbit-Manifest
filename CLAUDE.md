@@ -357,37 +357,43 @@ The objective is conjunction margin (see Optimizer — Design Decisions). Still 
   reshapes it again. Decide it as part of that work, or delete both batch functions and the
   OpenMP build dependency if separation never gets touched.
 
-### Conjunction time resolution — a live safety gap
-Separation is sampled every `dt` and the minimum over samples is reported. That
-overestimates the true miss distance, and the tail is dangerous. Measured against
-a dt=1 s reference on the live catalog at dt=60 s:
+### Conjunction time resolution — closed by the two-level sieve
+Separation is sampled every `dt` and the minimum over samples reported, which
+overestimates the true miss distance. The tail was dangerous: measured against a
+dt=1 s reference on the live catalog, a 60 s grid reported NORAD 63352's true
+4,005 m approach at T+2.897 h as **43,062 m at T+2.102 h** — a *different event*
+2,861 s away. The grid was not mis-measuring an approach, it was locking onto the
+wrong one, so the optimizer chose orbits against miss distances an order of
+magnitude too generous.
 
-| | coarse only | + parabola (now) |
-|---|---|---|
-| median overestimate | 1,576 m | **0 m** |
-| p95 | 47,695 m | 1,068 m |
-| worst | 331,316 m | 270,204 m |
+`_sieve` fixes it in two levels. Level 1 measures every object on the caller's
+grid. Level 2 re-measures the survivors **over the whole window again** at
+`dt / _SIEVE_FACTOR` — not around level 1's answer, which is the entire point.
+Promotion uses `_refine_gate`'s rigorous `v_rel·dt/2` bound, so nothing that could
+reach the gate is dropped, and only ~7% of the band is promoted.
 
-Parabolic sub-sample refinement is in and free — squared distance is exactly
-quadratic in time for a linear relative pass. It fixes the median completely.
+| vs dt=1 s reference | coarse | + parabola | **sieve** |
+|---|---|---|---|
+| median overestimate | 1,576 m | 2 m | **0 m** |
+| p95 | 47,695 m | 1,068 m | **0 m** |
+| worst | 331,316 m | 270,204 m | **23,086 m** |
+| nearest object | 20,962 m | 14,122 m | **4,006 m** (true 4,005 m) |
 
-**It does not fix the tail, and the tail is the safety case.** NORAD 63352's true
-closest approach is 4,005 m at T+2.897 h; the dt=60 s grid reports 43,062 m at
-T+2.102 h — a *different event*, 2,861 s away. The grid is not mis-measuring one
-approach, it is picking the wrong one, so no amount of refinement around its
-argmin can recover the real figure. The optimizer is therefore choosing orbits
-against miss distances that can be an order of magnitude too generous.
+Sampling everything at 10 s reaches the same accuracy and needs a 7 GB cache
+entry — too large for two buckets in 12 GB of VRAM. Gating first keeps level 2 to
+~480 MB. Level-2 positions are cached per object, so the expensive fine SGP4 is
+paid once per object across a whole run rather than once per candidate orbit.
 
-`_refine_candidates` (opt-in, `refine=True`) re-propagates gated objects around
-their coarse TCA. It lifts p95 from 1,068 m to 80 m for 6.6x the runtime and
-still names the wrong nearest object, which is why it is off by default.
+**Cost of correctness:** 24 ms -> 136 ms per candidate, so a full run goes from
+~15 min to ~85 min, and the cache reaches ~5 GB. That is the right trade for a
+conjunction checker: the alternative is a fast answer that names the wrong
+satellite. Memory is now the binding constraint — a failed GPU upload warns and
+degrades to numpy rather than killing the run.
 
-**The fix is a multi-level sieve**, not finer sampling everywhere: dt=10 s is
-accurate (p95 0 m, correct nearest) but needs a 7 GB cache entry, too large for
-two buckets in 12 GB of VRAM. Instead — pass 1 at dt=60 s over all N to gate on a
-generous bound; pass 2 at dt=10 s over only the ~7% that survive (≈480 MB); pass 3
-fine re-propagation on what remains. Each stage must gate on `_refine_gate`'s
-rigorous v_rel·dt/2 bound so nothing that could reach the threshold is dropped.
+Parabolic sub-sample refinement stays in both levels and costs nothing; squared
+distance is exactly quadratic in time for a linear relative pass.
+`_refine_candidates` (opt-in, `refine=True`) remains for a final verification
+pass, but the sieve supersedes it.
 
 ### Conjunction separation performance
 Separation is ~100% of a generation (see Performance) and the only worthwhile optimization

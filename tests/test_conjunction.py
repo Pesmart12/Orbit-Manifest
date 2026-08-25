@@ -575,3 +575,53 @@ def test_refinement_is_off_by_default_and_opt_in():
     from awareness.conjunction import check_conjunctions as cc, nearest_approach as na
     assert inspect.signature(cc).parameters["refine"].default is False
     assert inspect.signature(na).parameters["refine"].default is False
+
+
+# ---------------------------------------------------------------------------
+# Test 13 — the two-level sieve must match a brute-force fine grid
+# ---------------------------------------------------------------------------
+def test_sieve_matches_a_brute_force_fine_grid():
+    """A coarse grid + sieve must agree with sampling everything finely.
+
+    This is the property the whole design rests on. Level 2 re-searches the full
+    window rather than refining around level 1's answer, because a coarse grid
+    does not merely mis-measure an approach — it can lock onto the wrong one. On
+    the live catalog NORAD 63352's true 4,005 m approach at T+2.897 h was reported
+    by a 60 s grid as 43,062 m at T+2.102 h, a different event 2,861 s away.
+    """
+    epoch = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    a = R_EARTH + 500e3
+    state = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])
+    catalog = _band_catalog(n=25)
+    duration = 3 * 3600.0
+
+    coarse = {h.norad_id: h.min_separation_m for h in check_conjunctions(
+        state, epoch, duration, catalog, dt=60.0, threshold_m=1e9,
+        catalog_cache=CatalogCache())}
+    fine = {h.norad_id: h.min_separation_m for h in check_conjunctions(
+        state, epoch, duration, catalog, dt=10.0, threshold_m=1e9,
+        catalog_cache=CatalogCache())}
+
+    assert set(coarse) == set(fine) and coarse
+    for k in coarse:
+        # The sieve's second level runs at dt/6 = 10 s, so it must land on the
+        # same answer a straight 10 s grid finds.
+        assert coarse[k] == pytest.approx(fine[k], rel=1e-6, abs=1.0), (
+            f"NORAD {k}: sieve {coarse[k]:,.1f} m vs fine grid {fine[k]:,.1f} m"
+        )
+
+
+def test_sieve_never_reports_worse_than_its_coarse_level():
+    """Promotion can only lower a separation, never raise it."""
+    from awareness.conjunction import _closest_approaches, _sieve
+    epoch = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    a = R_EARTH + 500e3
+    state = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])
+    cache = CatalogCache()
+    duration, dt = 3 * 3600.0, 60.0
+    pos, names, _ = cache.get_or_compute(_band_catalog(n=25), epoch, duration, dt, a)
+
+    lvl1, _ = _closest_approaches(state, pos, dt, int(duration / dt))
+    sieved, _ = _sieve(state, pos, cache, epoch, duration, dt,
+                       gate_m=1e9, target_sma_m=a)
+    assert np.all(np.asarray(sieved) <= np.asarray(lvl1) + 1e-6)

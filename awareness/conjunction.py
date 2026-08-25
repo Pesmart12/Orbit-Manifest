@@ -37,6 +37,11 @@ _WARN_BYTES = 3 * 1024 ** 3  # 3 GB
 _CHUNK_CPU = 64
 _CHUNK_GPU = 1024
 
+# The second sieve level runs at dt / this. 6 turns the default 60 s grid into
+# 10 s, which measured p95 0 m error against a 1 s reference and picked the
+# correct nearest object; 20 s and coarser did not.
+_SIEVE_FACTOR = 6
+
 
 def _init_gpu():
     """Return the cupy module if it is importable AND can actually run a kernel.
@@ -237,6 +242,11 @@ class CatalogCache:
         self._store: dict = {}
         self._satrecs: dict = {}   # same keys as _store; used by the fine stage
         self._pending_key = None   # set by get_or_compute around a _compute call
+        # Level-2 positions, per bucket: {'rows': {obj_index: column}, 'arr': (T2, M, 3)}.
+        # Grown lazily as objects pass the level-1 gate, so the expensive fine SGP4
+        # is paid once per object across the whole optimizer run rather than once
+        # per candidate orbit.
+        self._fine: dict = {}
         self.bucket_m   = bucket_m
         self._warn_bytes = warn_bytes
         self._nbytes    = 0      # cumulative across every entry held
@@ -273,6 +283,61 @@ class CatalogCache:
     def _key(self, epoch: datetime, duration_s: float, dt: float, target_sma_m: float):
         bucket = round(target_sma_m / self.bucket_m) * self.bucket_m
         return (epoch.isoformat(), duration_s, dt, bucket)
+
+    def fine_positions(
+        self,
+        want: np.ndarray,
+        epoch: datetime,
+        duration_s: float,
+        dt: float,
+        fine_dt: float,
+        target_sma_m: float,
+    ):
+        """Level-2 catalog positions, computed once per object and reused.
+
+        Returns (positions (T2, M, 3), object_indices (M,)) covering every object
+        ever requested for this bucket — a superset of `want`. Returning the
+        superset avoids rebuilding a 480 MB array on each call; the caller maps the
+        columns it cares about back through `object_indices`.
+
+        The fine SGP4 is the expensive part (~20M evaluations for a few hundred
+        objects over 7 days at 10 s), so it must not be repeated per candidate
+        orbit. Level 1 gates hard enough that only ~7% of the band ever lands here.
+        """
+        key = self._key(epoch, duration_s, dt, target_sma_m)
+        satrecs = self._satrecs.get(key, [])
+        if not satrecs:
+            return None, np.empty(0, dtype=np.int64)
+
+        entry = self._fine.setdefault(key, {"rows": {}, "arr": None})
+        missing = [int(j) for j in want if int(j) not in entry["rows"]]
+
+        if missing:
+            n_fine = int(duration_s / fine_dt)
+            pos = _compute_catalog_positions(
+                SatrecArray([satrecs[j] for j in missing]), epoch, n_fine, fine_dt
+            )                                        # (T2, len(missing), 3), host
+            if self.use_gpu:
+                try:
+                    pos = _to_device(pos)
+                except Exception:
+                    pass
+            xp = _array_module(pos)
+            if entry["arr"] is None:
+                entry["arr"] = pos
+            else:
+                if _array_module(entry["arr"]) is not xp:   # backend changed mid-run
+                    pos = _cp.asnumpy(pos) if xp is _cp else _to_device(pos)
+                entry["arr"] = _array_module(entry["arr"]).concatenate(
+                    [entry["arr"], pos], axis=1
+                )
+            base = len(entry["rows"])
+            for offset, j in enumerate(missing):
+                entry["rows"][j] = base + offset
+            self._nbytes += int(np.prod(pos.shape)) * 8
+
+        idx = np.fromiter(entry["rows"].keys(), dtype=np.int64, count=len(entry["rows"]))
+        return entry["arr"], idx
 
     def satrecs_for(self, epoch: datetime, duration_s: float, dt: float,
                     target_sma_m: float) -> list:
@@ -398,8 +463,9 @@ def check_conjunctions(
     if N == 0:
         return []
 
-    min_sep, tca_s = _closest_approaches(
-        mission_state, catalog_pos, dt, n_steps
+    min_sep, tca_s = _sieve(
+        mission_state, catalog_pos, cache, epoch, duration_s, dt,
+        gate_m=threshold_m, target_sma_m=target_sma_m,
     )
     if refine:
         min_sep, tca_s = _refine_candidates(
@@ -516,6 +582,63 @@ def _closest_approaches(
     if xp is not np:
         min_sep, t_ref = _cp.asnumpy(min_sep), _cp.asnumpy(t_ref)
     return min_sep, t_ref
+
+
+def _sieve(
+    mission_state: np.ndarray,
+    catalog_pos,
+    cache: "CatalogCache",
+    epoch: datetime,
+    duration_s: float,
+    dt: float,
+    gate_m: float,
+    target_sma_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Two-level search for each object's true closest approach.
+
+    Level 1 measures every object on the caller's grid. Level 2 re-measures the
+    survivors **over the whole window again** at dt/_SIEVE_FACTOR — not around
+    level 1's answer. That distinction is the entire point: a coarse grid does not
+    merely mis-measure an approach, it can lock onto the wrong one. On the live
+    catalog NORAD 63352's true 4,005 m approach at T+2.897 h was reported as
+    43,062 m at T+2.102 h — a different event 2,861 s away, which no refinement
+    around the first answer could ever find.
+
+    Sampling everything at 10 s would also fix it, at 7 GB per cache entry — too
+    large to hold two buckets in 12 GB of VRAM. Gating first keeps level 2 to ~7%
+    of the band, about 480 MB.
+
+    `gate_m` is what the caller cares about beating: the conjunction threshold, or
+    the current best separation. Objects are promoted when they could still get
+    below it, judged by `_refine_gate`'s rigorous v_rel·dt/2 bound, so promotion
+    never drops something that could reach `gate_m`.
+    """
+    n_steps = int(duration_s / dt)
+    min_sep, tca_s = _closest_approaches(mission_state, catalog_pos, dt, n_steps)
+
+    promote = np.flatnonzero(min_sep < _refine_gate(dt, gate_m, target_sma_m))
+    if promote.size == 0:
+        return min_sep, tca_s
+
+    fine_dt = dt / _SIEVE_FACTOR
+    fine_pos, obj_idx = cache.fine_positions(
+        promote, epoch, duration_s, dt, fine_dt, target_sma_m
+    )
+    if fine_pos is None or obj_idx.size == 0:
+        return min_sep, tca_s
+
+    n_fine = int(duration_s / fine_dt)
+    fine_min, fine_tca = _closest_approaches(
+        mission_state, fine_pos, fine_dt, n_fine
+    )
+
+    # Level 2 searched the full window, so its answer supersedes level 1 outright
+    # rather than being min()'d with it — level 1 may have found a different event.
+    min_sep = np.array(min_sep, copy=True)
+    tca_s   = np.array(tca_s, copy=True)
+    min_sep[obj_idx] = fine_min
+    tca_s[obj_idx]   = fine_tca
+    return min_sep, tca_s
 
 
 def _refine_candidates(
@@ -639,7 +762,12 @@ def nearest_approach(
     if len(names) == 0:
         return None
 
-    min_sep, tca_s = _closest_approaches(mission_state, catalog_pos, dt, n_steps)
+    min_sep, tca_s = _sieve(
+        mission_state, catalog_pos, cache, epoch, duration_s, dt,
+        gate_m=float(np.min(_closest_approaches(
+            mission_state, catalog_pos, dt, n_steps)[0])),
+        target_sma_m=target_sma_m,
+    )
     if refine:
         # Gate on the current best: only objects that could beat it need re-measuring.
         min_sep, tca_s = _refine_candidates(
