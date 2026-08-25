@@ -122,6 +122,11 @@ def _objective_str(plan: MissionPlan) -> str:
     A candidate whose altitude shell holds no catalog objects scores a sentinel
     rather than a real distance; printing that verbatim gives "1000000.00 km".
     """
+    # 1e10 is the optimizer's rejection penalty: every candidate it evaluated was
+    # unsafe, so there is no margin to report. Rendering it as a distance gave
+    # "-10,000,000.00 km".
+    if plan.result.objective >= 1e10:
+        return "no safe orbit found"
     if plan.result.nearest is None:
         return "no objects in band"
     return f"{-plan.result.objective / 1000.0:,.2f} km"

@@ -41,7 +41,7 @@ Natural Language Input
         ▼
   Differential Evolution         ← scipy optimizer over 5 Keplerian elements
         ├──► C++ RK4 Integrator (pybind11)    ← fast 2-body + J2 propagation
-        └──► Conjunction Checker              ← vectorized SGP4 vs live TLE catalog
+        └──► Conjunction Checker              ← two-level SGP4 sieve, GPU or numpy
         │
         ▼
   Output Composer                ← text report + ground-track PNG
@@ -55,8 +55,8 @@ Natural Language Input
 | Constraint Solver | Python | Mission goal → `OrbitalBounds` |
 | Optimizer | scipy `differential_evolution` | Global search over Keplerian elements |
 | Integrator | C++17 / pybind11 | RK4 2-body + J2 propagation |
-| Conjunction Checker | python-sgp4, numpy | Vectorized catalog vs mission orbit |
-| TLE Catalog | Space-Track.org | Live LEO catalog (~20 k objects, 24-hr cache) |
+| Conjunction Checker | python-sgp4, CuPy / numpy | Two-level sieve, catalog vs mission orbit |
+| TLE Catalog | Space-Track.org | Live catalog (32 k objects, 24-hr cache) |
 | Output | matplotlib | Ground-track plot + formatted text report |
 
 ---
@@ -71,7 +71,26 @@ The C++ integrator implements:
 
 The TLE catalog is propagated with **SGP4** (python-sgp4) — the correct model for TLE mean elements. The mission orbit uses RK4 on osculating elements. The two are never mixed.
 
-Conjunction checking is fully vectorized: a single `SatrecArray.sgp4()` call produces a `(T, N, 3)` position array; separation is computed with one numpy broadcast, no Python loop over time steps. Performance: ~2 s/generation vs ~37 s before refactoring.
+### Conjunction screening
+
+The catalog is propagated in one vectorised `SatrecArray.sgp4()` call into a
+`(T, N, 3)` position array, cached per altitude bucket for the length of an
+optimizer run.
+
+Screening is a **two-level sieve**, because sampling separations on a fixed grid
+does not merely mis-measure a close approach — it can miss which approach matters.
+Measured against a 1-second reference on the live catalog, a 60-second grid
+reported one object's true 4.0 km pass as 43.1 km, having locked onto a different
+event 48 minutes away. Level 1 measures every object on the coarse grid; level 2
+re-searches the **whole window again** at 10 s for objects that could still reach
+the threshold, promoted on a rigorous relative-velocity bound so nothing is
+dropped. Sub-sample parabolic interpolation then recovers the true minimum
+between samples.
+
+Separation runs on the GPU through **CuPy** when it is available, falling back to
+numpy otherwise; both produce bit-identical results and the test suite asserts it.
+On a 4,873-object band the GPU is 33.8x faster per candidate, which is what makes
+the sieve affordable at all — a full run is ~1.4 h with it against ~52 h without.
 
 ---
 
@@ -84,6 +103,9 @@ Conjunction checking is fully vectorized: a single `SatrecArray.sgp4()` call pro
 - CMake 3.20+
 - [Anthropic API key](https://console.anthropic.com) (`sk-ant-...`)
 - [Space-Track.org](https://www.space-track.org) account (free)
+- *Optional:* an NVIDIA GPU. With CuPy installed (`conda install -c conda-forge cupy`)
+  conjunction screening runs on the GPU; without it everything still works on numpy,
+  just slower. Set `ORBIT_MANIFEST_NO_GPU=1` to force the numpy path.
 
 ### Installation
 
@@ -114,10 +136,10 @@ No quotes, no spaces around `=`.
 ### Run
 
 ```bash
-# Quick pipeline check (~30 s, low-fidelity)
+# Quick pipeline check — low-fidelity, verifies the pipeline end to end
 python run.py "7-day sun-synchronous Earth observation at 550 km" --quick
 
-# Full production run (~17 min on 8-core machine)
+# Full production run (~1.4 h on an RTX 4070; longer on CPU — see note below)
 python run.py "7-day sun-synchronous Earth observation at 550 km"
 
 # Other options
@@ -136,43 +158,67 @@ pytest tests/
 
 ## Sample Output
 
+Real output from an abbreviated run (14 generations; a full run searches 500)
+against the live catalog. The 550 km sun-synchronous shell is crowded, and a
+short search does not find a clear orbit — which is the tool doing its job:
+
 ```
-══════════════════════════════════════════════════════════════
-                 ORBIT MANIFEST — Mission Report
-══════════════════════════════════════════════════════════════
+==============================================================
+                ORBIT MANIFEST — Mission Report               
+==============================================================
 
   Mission:    7-day sun-synchronous Earth observation at 550 km
   Orbit type: Sun Synchronous
-  Generated:  2025-06-19 14:32:07 UTC
+  Generated:  2026-08-25 00:00:00 UTC
   Rationale:  SSO at 550 km provides consistent solar lighting for imaging
 
 ──────────────────────────────────────────────────────────────
   OPTIMAL ORBITAL ELEMENTS
 ──────────────────────────────────────────────────────────────
-  Semi-major axis:      6928.10 km
-  Altitude (peri):       549.8 km
-  Altitude (apo):        550.2 km
-  Inclination:            97.6412 °
-  Eccentricity:         0.000061
-  Period:                97.4 min
-  RAAN:                  135.22 °
-  Arg. of perigee:        22.07 °
+  Semi-major axis:      6913.46 km
+  Altitude (peri):       532.81 km
+  Altitude (apo):        537.91 km
+  Inclination:          97.6467 °
+  Eccentricity:        0.000368
+  Period:                 95.35 min
+  RAAN:                  234.36 °
+  Arg. of perigee:       269.98 °
 
 ──────────────────────────────────────────────────────────────
   CONJUNCTION SAFETY
 ──────────────────────────────────────────────────────────────
-  Catalog size:          24,857 objects
-  Safety status:         SAFE  ✓
+  Catalog size:          32,364 objects
+  Screened:               8,019 objects in the altitude band
+  Safety status:     CONJUNCTION RISK  ✗
+
+  Closest approach:        2.66 km
+    object:          BREEZE-KM R/B (NORAD 43438)
+    at:              T+4 d 00:21
+
+  Objects within threshold (11):
+        2.66 km  T+4 d 00:21   BREEZE-KM R/B (NORAD 43438)
+        2.82 km  T+21:33       FENGYUN 1C DEB (NORAD 36203)
+        3.13 km  T+4 d 07:52   STARLINK-5221 (NORAD 54091)
+        3.42 km  T+3 d 20:23   TDS 1 (NORAD 40076)
+        3.60 km  T+3 d 04:34   FENGYUN 1C DEB (NORAD 31441)
+        3.87 km  T+10:50       DELTA 1 DEB (NORAD 10234)
+        3.89 km  T+2 d 18:56   OBJECT B (NORAD 69098)
+        4.27 km  T+3 d 13:13   STARLINK-5811 (NORAD 55787)
+        4.45 km  T+1 d 05:34   COSMOS 2151 (NORAD 21422)
+        4.50 km  T+2 d 21:03   DELTA 1 DEB (NORAD 39102)
+    … and 1 more
 
 ──────────────────────────────────────────────────────────────
   OPTIMIZER STATISTICS
 ──────────────────────────────────────────────────────────────
-  Converged:                    Yes
-  Objective (ecc):         0.000061
-  Generations:                  312
-  Conjunction calls:         23,400
-  Wall-clock time:            982.4 s
+  Converged:                Yes
+  Objective (margin): no safe orbit found
+  Generations:                2
+  Conjunction calls:         40
+  Wall-clock time:         97.9 s
   Message:           Optimization terminated successfully.
+
+==============================================================
 ```
 
 ---

@@ -42,6 +42,12 @@ _CHUNK_GPU = 1024
 # correct nearest object; 20 s and coarser did not.
 _SIEVE_FACTOR = 6
 
+# Ceiling on the level-2 position store. Level 2 tends toward holding most of the
+# band at fine resolution across an optimizer run — 7 GB for a 7-day mission at
+# 10 s — which will not fit beside level 1 on a 12 GB card. Objects beyond the
+# budget keep their level-1 separation and the cache warns once.
+_FINE_BUDGET_BYTES = 3 * 1024 ** 3   # 3 GB
+
 
 def _init_gpu():
     """Return the cupy module if it is importable AND can actually run a kernel.
@@ -238,7 +244,12 @@ class CatalogCache:
         bucket_m: float = _BUCKET_M,
         warn_bytes: float = _WARN_BYTES,
         use_gpu: bool | None = None,
+        fine_budget_bytes: float = _FINE_BUDGET_BYTES,
     ) -> None:
+        # Ceiling on the level-2 store. It wants to hold most of the band at fine
+        # resolution — 7 GB for a 7-day mission at 10 s — which does not fit
+        # alongside level 1 and its temporaries on a 12 GB card.
+        self.fine_budget_bytes = fine_budget_bytes
         self._store: dict = {}
         self._satrecs: dict = {}   # same keys as _store; used by the fine stage
         self._pending_key = None   # set by get_or_compute around a _compute call
@@ -309,35 +320,60 @@ class CatalogCache:
         if not satrecs:
             return None, np.empty(0, dtype=np.int64)
 
-        entry = self._fine.setdefault(key, {"rows": {}, "arr": None})
+        n_fine = int(duration_s / fine_dt)
+        T2 = n_fine + 1
+        col_bytes = T2 * 3 * 8
+
+        entry = self._fine.get(key)
+        if entry is None:
+            # Preallocate to a byte budget and fill columns in place. Growing by
+            # concatenate instead would rebuild the array on every promotion and
+            # hold old + new at once, doubling peak memory — that is what
+            # exhausted a 12 GB card mid-run (19.6 GB allocated, asking 10.2 more).
+            cap = max(1, min(len(satrecs), int(self.fine_budget_bytes // col_bytes)))
+            xp = _cp if self.use_gpu else np
+            try:
+                arr = xp.empty((T2, cap, 3), dtype=np.float64)
+            except Exception:                       # not enough VRAM — use the host
+                arr, xp = np.empty((T2, cap, 3), dtype=np.float64), np
+            entry = {"rows": {}, "arr": arr, "used": 0, "cap": cap, "full": False}
+            self._fine[key] = entry
+            self._nbytes += cap * col_bytes
+
         missing = [int(j) for j in want if int(j) not in entry["rows"]]
+        room = entry["cap"] - entry["used"]
+        if len(missing) > room:
+            if not entry["full"]:
+                entry["full"] = True
+                warnings.warn(
+                    f"Level-2 sieve cache is full at {entry['cap']:,} objects "
+                    f"({self.fine_budget_bytes / 1024**3:.1f} GB budget). Further "
+                    "objects keep their coarser level-1 separation, which can "
+                    "overestimate a close approach. Raise fine_budget_bytes, "
+                    "increase dt, or shorten duration_s.",
+                    ResourceWarning,
+                    stacklevel=4,
+                )
+            missing = missing[:room]
 
         if missing:
-            n_fine = int(duration_s / fine_dt)
             pos = _compute_catalog_positions(
                 SatrecArray([satrecs[j] for j in missing]), epoch, n_fine, fine_dt
             )                                        # (T2, len(missing), 3), host
-            if self.use_gpu:
-                try:
-                    pos = _to_device(pos)
-                except Exception:
-                    pass
-            xp = _array_module(pos)
-            if entry["arr"] is None:
-                entry["arr"] = pos
-            else:
-                if _array_module(entry["arr"]) is not xp:   # backend changed mid-run
-                    pos = _cp.asnumpy(pos) if xp is _cp else _to_device(pos)
-                entry["arr"] = _array_module(entry["arr"]).concatenate(
-                    [entry["arr"], pos], axis=1
-                )
-            base = len(entry["rows"])
+            dst = entry["arr"]
+            block = _to_device(pos) if _array_module(dst) is _cp else pos
+            lo = entry["used"]
+            dst[:, lo:lo + len(missing), :] = block
             for offset, j in enumerate(missing):
-                entry["rows"][j] = base + offset
-            self._nbytes += int(np.prod(pos.shape)) * 8
+                entry["rows"][j] = lo + offset
+            entry["used"] += len(missing)
+
+        if entry["used"] == 0:
+            return None, np.empty(0, dtype=np.int64)
 
         idx = np.fromiter(entry["rows"].keys(), dtype=np.int64, count=len(entry["rows"]))
-        return entry["arr"], idx
+        # Hand back only the filled columns; the tail is uninitialised.
+        return entry["arr"][:, :entry["used"], :], idx
 
     def satrecs_for(self, epoch: datetime, duration_s: float, dt: float,
                     target_sma_m: float) -> list:

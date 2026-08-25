@@ -384,3 +384,17 @@ def test_report_shows_margin_in_km_when_there_is_traffic():
     plan.result.objective = -13_761_400.0
     report = format_report(plan, epoch=_EPOCH)
     assert "13,761.40 km" in report
+
+
+def test_report_does_not_render_the_rejection_penalty_as_a_distance():
+    """Every candidate unsafe means no margin exists, not a margin of -1e7 km.
+
+    The optimizer scores rejected candidates 1e10; a real run that found no safe
+    orbit printed "Objective (margin): -10,000,000.00 km".
+    """
+    plan = _plan_with_conjunctions(hits=[_hit("SL-16 DEB", "22392", 0.8, 46860.0)],
+                                   nearest=_hit("SL-16 DEB", "22392", 0.8, 46860.0))
+    plan.result.objective = 1e10
+    report = format_report(plan, epoch=_EPOCH)
+    assert "no safe orbit found" in report
+    assert "-10,000,000" not in report and "10,000,000.00 km" not in report
