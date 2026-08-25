@@ -462,3 +462,62 @@ def test_parse_survives_a_malformed_entry_without_losing_the_rest():
     text = good + "\nGARBAGE LINE THAT IS NOT A TLE\n" + "\n".join(_pair(39999))
     parsed = _parse(text)
     assert len(parsed) == 5, f"expected 4 good + 1 after the garbage, got {len(parsed)}"
+
+
+# ---------------------------------------------------------------------------
+# Test 11 — the GPU and numpy backends must produce identical answers
+# ---------------------------------------------------------------------------
+from awareness.conjunction import GPU_AVAILABLE  # noqa: E402
+
+
+def _band_catalog(n: int = 40, centre_km: float = 500.0) -> list[tuple]:
+    """Objects spread across the screening band so several survive the filter."""
+    return [_make_tle(centre_km - 20.0 + i, 14000 + i) for i in range(n)]
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="CuPy not usable on this machine")
+def test_gpu_and_numpy_agree():
+    """Same query, both backends, identical results.
+
+    The GPU path exists only for speed. If it ever disagrees with numpy about a
+    separation, it is a safety bug — this is a conjunction checker, and the two
+    implementations must be interchangeable.
+    """
+    epoch = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    a = R_EARTH + 500e3
+    state = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])
+    catalog = _band_catalog()
+    duration, dt = 7200.0, 30.0
+
+    gpu_cache = CatalogCache(use_gpu=True)
+    cpu_cache = CatalogCache(use_gpu=False)
+    assert gpu_cache.use_gpu and not cpu_cache.use_gpu
+
+    g_hits = check_conjunctions(state, epoch, duration, catalog, dt=dt,
+                                threshold_m=1e9, catalog_cache=gpu_cache)
+    c_hits = check_conjunctions(state, epoch, duration, catalog, dt=dt,
+                                threshold_m=1e9, catalog_cache=cpu_cache)
+
+    assert len(g_hits) == len(c_hits) > 0, "test needs objects inside the band"
+    for g, c in zip(g_hits, c_hits):
+        assert g.norad_id == c.norad_id
+        assert g.min_separation_m == pytest.approx(c.min_separation_m, rel=1e-12)
+        assert g.time_of_closest_approach_s == c.time_of_closest_approach_s
+
+    g_near = nearest_approach(state, epoch, duration, catalog, dt=dt,
+                              catalog_cache=gpu_cache)
+    c_near = nearest_approach(state, epoch, duration, catalog, dt=dt,
+                              catalog_cache=cpu_cache)
+    assert g_near.norad_id == c_near.norad_id
+    assert g_near.min_separation_m == pytest.approx(c_near.min_separation_m, rel=1e-12)
+
+
+def test_numpy_backend_used_when_gpu_disabled():
+    """use_gpu=False must keep the catalog on the host regardless of hardware."""
+    epoch = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    a = R_EARTH + 500e3
+    state = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])
+    cache = CatalogCache(use_gpu=False)
+    pos, names, _ = cache.get_or_compute(_band_catalog(), epoch, 3600.0, 30.0, a)
+    assert names
+    assert isinstance(pos, np.ndarray), "forced-numpy cache must hold a host array"

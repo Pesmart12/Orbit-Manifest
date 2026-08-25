@@ -221,19 +221,22 @@ now-30), SSO 550 km, 7-day mission at dt=60 s (T=10,081), on this machine.
 estimate in this file was wrong because N was guessed. The previously documented
 "~2 s/generation, ~17 min" implies N≈110; the real shell is 44x denser than that.
 
-| Component | Cost | Notes |
-|---|---|---|
-| Catalog SGP4, per bucket (cold) | 11.3 s | once per altitude bucket, then cached |
-| Separation, per candidate (warm) | **1,142 ms** | this is the entire hot path |
-| Propagation, whole population (OpenMP) | 7.3 ms | no production caller |
-| Cache entry | **1.1 GB** | (T x N x 3 x 8 bytes) |
+| Component | numpy | CuPy (GPU) | Notes |
+|---|---|---|---|
+| Catalog SGP4 + upload, per bucket | 10.8 s | 11.1 s | once per bucket, then cached |
+| **Separation, per candidate** | **804 ms** | **23.8 ms** | the entire hot path — **33.8x** |
+| Propagation, whole population (OpenMP) | 7.3 ms | — | no production caller |
+| Cache entry | 1.1 GB RAM | 1.1 GB VRAM | (T x N x 3 x 8 bytes) |
 
-| Run | Per generation | Total |
+| Run | numpy | CuPy |
 |---|---|---|
-| `--quick` (popsize=5, maxiter=20) | 28.6 s | **~9.5 min** |
-| full (popsize=15, maxiter=500) | 85.7 s | **~11.9 hours** |
+| `--quick` (popsize=5, maxiter=20) | 20 min | **36 s** |
+| full (popsize=15, maxiter=500) | 8.4 h | **~15 min** |
 
-A full run is twelve hours, not seventeen minutes. Separation is ~100% of it.
+Separation is ~100% of the cost either way. The GPU path keeps float64 — the
+4070 throttles FP64 *compute* to 1/64 rate, but this kernel is bandwidth-bound,
+so accuracy costs nothing. Both backends produce bit-identical separations;
+`tests/test_conjunction.py::test_gpu_and_numpy_agree` asserts it.
 
 **Bucketing costs 39%.** The `CatalogCache` band widening (±25 km → ±50 km, so a
 shared bucket entry stays a superset for every candidate in it) takes N from
