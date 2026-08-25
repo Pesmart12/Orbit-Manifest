@@ -1,6 +1,0 @@
-# pip-only packages — install after activating the conda environment:
-#   pip install -r requirements.txt
-sgp4
-anthropic
-matplotlib
-python-dotenv

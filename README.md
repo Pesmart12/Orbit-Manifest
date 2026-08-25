@@ -91,12 +91,9 @@ Conjunction checking is fully vectorized: a single `SatrecArray.sgp4()` call pro
 git clone https://github.com/yourusername/orbit-manifest
 cd orbit-manifest
 
-# Create and activate conda environment
+# Create and activate conda environment (installs every dependency)
 conda env create -f environment.yml
 conda activate orbit-manifest
-
-# Install pip-only packages
-pip install -r requirements.txt
 
 # Build the C++ integrator (must come last)
 pip install -e .

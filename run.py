@@ -15,6 +15,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def _configure_output_encoding() -> None:
+    """Let stdout/stderr carry the box-drawing characters this CLI prints.
+
+    On Windows a *redirected* stdout defaults to the locale encoding (cp1252),
+    which cannot encode ─ ━ █ ░ → …, so `python run.py "..." > out.txt` died with
+    UnicodeEncodeError — after the optimizer had already spent its full run.
+
+    UTF-8 fixes the ordinary case; errors="replace" means a console that still
+    cannot represent a glyph degrades to '?' rather than throwing away the work.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # Not a reconfigurable text stream (pytest capture, a custom wrapper).
+            # Nothing to do — the default encoding is whatever the caller set up.
+            pass
+
+
 def _progress_bar(gen: int, best: float, t0: float, maxiter: int) -> None:
     elapsed = time.perf_counter() - t0
     pct = min(100, gen * 100 // maxiter)
@@ -29,6 +48,8 @@ def _progress_bar(gen: int, best: float, t0: float, maxiter: int) -> None:
 
 
 def main() -> int:
+    _configure_output_encoding()
+
     parser = argparse.ArgumentParser(
         prog="run.py",
         description="Orbit Manifest — natural language orbital mission design",

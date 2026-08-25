@@ -9,18 +9,16 @@ A natural language orbital mission design agent. Users describe a mission goal i
 
 ## Build Commands
 
-All Python runs through conda. Activate your environment first.
+All Python runs through conda. `environment.yml` is the single source of
+dependencies — it covers runtime, build (`pybind11`, `setuptools`, `cmake`) and
+`anthropic` via its own `pip:` section. **Do not `pip install` anything it already
+provides**: pip-over-conda is what silently replaced `scipy` with a wheel carrying
+its own BLAS, and reinstalling it damaged the conda package underneath.
 
 ```bash
-# Create environment (first time)
+# Create environment (first time) — installs everything, build deps included
 conda env create -f environment.yml
 conda activate orbit-manifest
-
-# Install build dependencies (first time)
-pip install pybind11 numpy setuptools
-
-# Install Python dependencies (includes sgp4, anthropic, matplotlib, python-dotenv)
-pip install -r requirements.txt
 
 # Build C++ integrator and install as Python module — do this before anything else
 pip install -e .
