@@ -3,7 +3,7 @@ Pre-propagation orbit screen for the orbital optimizer.
 
 Checks Keplerian parameters before keplerian_to_cartesian or RK4 propagation,
 catching physically degenerate candidates in O(1) arithmetic so they never
-enter the OpenMP kernel.
+reach the integrator or the conjunction check.
 
 Post-propagation checks (energy/momentum conservation) live in
 physics/post_propagation.py and are used by the accuracy experiment, not the
@@ -20,13 +20,15 @@ class OrbitScreen:
     """Pre-propagation rejection gate for the orbital optimizer.
 
     Instantiate once before the optimization loop and call
-    check_pre_propagation on every candidate before the batch propagation.
+    check_pre_propagation on every candidate before it is propagated.
     All arithmetic is O(1) — no integrator calls.
 
     Args:
         min_perigee_alt_m: Minimum allowed perigee altitude above surface (m).
-                           Default 150 km — below this, atmospheric drag is
-                           significant and the no-drag RK4 model is invalid.
+                           Default 150 km — a sanity floor for orbits that
+                           would decay almost immediately. Not a validity
+                           boundary for the no-drag model: drag already moves
+                           a 550 km orbit by kilometres over a week.
         max_apogee_m:      Maximum allowed apogee radius from Earth centre (m).
                            Default R_EARTH + 2500 km — above this the orbit
                            exits the LEO conjunction shell.
@@ -53,8 +55,8 @@ class OrbitScreen:
         """Screen a Keplerian candidate before keplerian_to_cartesian or RK4.
 
         All arithmetic is O(1) with no propagation. Runs on every candidate
-        in the population before the batch propagation call so that pathological
-        orbits never enter the OpenMP kernel.
+        in the population before any propagation, so that pathological orbits
+        never reach the integrator or the conjunction check.
 
         Args:
             sma:     Semi-major axis (m)
@@ -81,7 +83,7 @@ class OrbitScreen:
             floor_km = self.min_perigee_alt_m / 1e3
             reasons.append(
                 f"perigee {alt_km:.1f} km below {floor_km:.0f} km floor "
-                "(drag significant; no-drag RK4 model invalid)"
+                "(orbit would decay almost immediately)"
             )
 
         if r_apogee > self.max_apogee_m:
@@ -96,7 +98,7 @@ class OrbitScreen:
             reasons.append(
                 f"integration window {t_total / 60:.1f} min < orbital period "
                 f"{T_orbit / 60:.1f} min "
-                "(mission objective at final state is meaningless)"
+                "(conjunction screen would cover less than one revolution)"
             )
 
         return (not reasons), reasons

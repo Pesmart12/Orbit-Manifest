@@ -2,13 +2,13 @@
 Post-propagation integrity checks: energy and angular momentum conservation.
 
 These functions are kept separate from the pre-propagation screen
-(solver/physics_agreement.py) because they serve a different purpose:
+(physics/pre_propagation.py) because they serve a different purpose:
 the pre-propagation check is a cheap O(1) gate used in the production
 optimizer; the post-propagation check is a physics accuracy evaluator
-used in experiments comparing propagator variants.
+for experiments comparing propagator variants, and is not wired in.
 
-Constants mirror those in solver/physics_agreement.py and
-integrator/integrator.h. If you change them, change them everywhere.
+Constants come from physics/constants.py; tests/test_constants.py enforces
+that integrator/integrator.h agrees with them.
 """
 from __future__ import annotations
 
@@ -66,9 +66,13 @@ def check_post_propagation(
        to within energy_tol J/kg. J2 is a conservative potential so
        total energy is an invariant of the model.
 
-    4. Specific angular momentum magnitude is conserved to within
-       momentum_tol_rel (relative). J2 is axially symmetric, so
-       |h| = √(μa(1−e²)) is preserved at first order.
+    4. Specific angular momentum magnitude |h| is compared to within
+       momentum_tol_rel (relative). KNOWN DEFECT: J2 is axially symmetric,
+       so only the z-component of h is conserved — |h| oscillates every orbit
+       as the plane precesses. Measured on correct RK4 at dt=10 s over one day,
+       |h| swings 8.5e-4 at 51.6° and 1.4e-3 at 97.6° (h_z: 2e-10), so with
+       the default tolerance this check rejects accurate integrations of any
+       inclined orbit. Exact only for equatorial orbits.
 
     Args:
         s0:               Initial Cartesian ECI state, shape (6,).
