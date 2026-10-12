@@ -42,6 +42,13 @@ _CHUNK_GPU = 1024
 # correct nearest object; 20 s and coarser did not.
 _SIEVE_FACTOR = 6
 
+# Longest step the RK4 integrator takes for the mission orbit, whatever grid the
+# separation is sampled on. Coarser grids are reached by sub-stepping and keeping
+# every k-th state. Measured over 7 days at 550 km SSO against a 1 s reference:
+# 11.5 m of position error at 10 s, 2.6 km at 30 s, 80 km at 60 s. Integrating at
+# the 60 s sampling grid directly put level 1 off by more than _refine_gate allows.
+_MISSION_DT_MAX = 10.0
+
 # Ceiling on the level-2 position store. Level 2 tends toward holding most of the
 # band at fine resolution across an optimizer run — 7 GB for a 7-day mission at
 # 10 s — which will not fit beside level 1 on a 12 GB card. Objects beyond the
@@ -546,8 +553,13 @@ def _closest_approaches(
     identical results, and is the form the GPU wants too.
     """
     # Propagate mission orbit with C++ RK4; positions only (columns 0-2).
-    # Always numpy — the integrator is a CPU extension.
-    mission_pos = np.asarray(oi.propagate_single(mission_state, dt, n_steps))[:, :3]
+    # Always numpy — the integrator is a CPU extension. Integrate at no more than
+    # _MISSION_DT_MAX and keep every sub-th state, so the trajectory lands on the
+    # catalog's dt grid without inheriting RK4's error at that step size.
+    sub = max(1, int(np.ceil(dt / _MISSION_DT_MAX - 1e-9)))
+    mission_pos = np.asarray(
+        oi.propagate_single(mission_state, dt / sub, n_steps * sub)
+    )[::sub, :3]
 
     xp = _array_module(catalog_pos)
     if xp is not np:
@@ -768,6 +780,10 @@ def _refine_gate(dt: float, threshold_m: float, target_sma_m: float) -> float:
     Bounding v_rel by two circular velocities at this radius (a head-on pass, the
     worst case) makes the gate rigorous: anything above it provably cannot reach
     threshold_m, so skipping it cannot hide a conjunction.
+
+    The bound covers sampling error only. It holds because _closest_approaches
+    integrates the mission at _MISSION_DT_MAX regardless of dt, keeping integration
+    error to metres; at the raw 60 s step it reached 80 km and broke the bound.
     """
     v_circ = float(np.sqrt(MU_EARTH / max(target_sma_m, R_EARTH)))
     return threshold_m + 2.0 * v_circ * dt / 2.0

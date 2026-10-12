@@ -612,7 +612,14 @@ def test_sieve_matches_a_brute_force_fine_grid():
 
 
 def test_sieve_never_reports_worse_than_its_coarse_level():
-    """Promotion can only lower a separation, never raise it."""
+    """Promotion can only lower a separation, never raise it — up to the fit.
+
+    On raw samples this is exact: the dt/6 grid contains every level-1 sample.
+    Parabolic refinement loosens it slightly. At these 12,000 km separations the
+    pass is far from linear, and level 1's three-point fit can extrapolate tens of
+    metres below its own samples; level 2's finer fit is the more accurate one and
+    measured up to 0.43 m higher (3.5e-8 relative). Hence a relative tolerance.
+    """
     from awareness.conjunction import _closest_approaches, _sieve
     epoch = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
     a = R_EARTH + 500e3
@@ -624,4 +631,31 @@ def test_sieve_never_reports_worse_than_its_coarse_level():
     lvl1, _ = _closest_approaches(state, pos, dt, int(duration / dt))
     sieved, _ = _sieve(state, pos, cache, epoch, duration, dt,
                        gate_m=1e9, target_sma_m=a)
-    assert np.all(np.asarray(sieved) <= np.asarray(lvl1) + 1e-6)
+    lvl1 = np.asarray(lvl1)
+    assert np.all(np.asarray(sieved) <= lvl1 * (1.0 + 1e-6) + 1e-6)
+
+
+def test_mission_integration_error_stays_inside_the_gate():
+    """Level 1 samples at 60 s, but must not integrate the mission at 60 s.
+
+    RK4 at 60 s drifts 80 km over a week at 550 km — far more than the sampling
+    error _refine_gate budgets for, so the gate's guarantee would be void. A
+    single "catalog object" placed at the true final position (1 s reference),
+    with every other sample far away, makes min_sep the mission's end-of-window
+    integration error.
+    """
+    import orbit_integrator as oi
+    from awareness.conjunction import _closest_approaches
+
+    a = R_EARTH + 550e3
+    state0 = np.array([a, 0.0, 0.0, 0.0, 0.0, np.sqrt(MU_EARTH / a)])  # polar
+    dt, n_steps = 60.0, int(7 * 86400 / 60.0)
+
+    truth = np.asarray(oi.propagate_single_final(state0, 1.0, int(n_steps * dt)))
+    catalog_pos = np.full((n_steps + 1, 1, 3), 1e9)
+    catalog_pos[-1, 0] = truth[:3]
+
+    min_sep, _ = _closest_approaches(state0, catalog_pos, dt, n_steps)
+    assert min_sep[0] < 100.0, (
+        f"mission position off by {min_sep[0]:.0f} m after 7 days at dt={dt}"
+    )
