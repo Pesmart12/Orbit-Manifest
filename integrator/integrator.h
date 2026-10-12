@@ -19,9 +19,10 @@ StateVector rk4_step(const StateVector& s, double dt);
 // Propagate from s0 — returns full trajectory including initial state (n_steps+1 rows)
 std::vector<StateVector> propagate(const StateVector& s0, double dt, int n_steps);
 
-// Propagate from s0 — returns only the terminal state (optimizer fast path)
+// Propagate from s0 — returns only the terminal state (no trajectory allocation)
 StateVector propagate_final(const StateVector& s0, double dt, int n_steps);
 
-// Propagate N orbits — returns only terminal states (main optimizer use case)
+// Propagate N orbits in parallel (OpenMP) — returns only terminal states.
+// No production caller; validated by tests/test_integrator.py.
 std::vector<StateVector> propagate_batch_final(
     const std::vector<StateVector>& states, double dt, int n_steps);

@@ -164,10 +164,13 @@ def run_optimizer(
     """Find the safest orbit within the given bounds.
 
     Runs scipy differential_evolution with a batch fitness function that:
-    1. Converts the DE population (Keplerian elements) to ECI states.
-    2. Batch-propagates all N candidates with the C++ RK4 integrator.
-    3. Rejects candidates with conjunctions (scores them 1e10).
-    4. Scores survivors by orbital eccentricity of the terminal state.
+    1. Drops degenerate candidates with the O(1) pre-propagation screen.
+    2. Converts the survivors (Keplerian elements) to ECI states.
+    3. Calls nearest_approach once per survivor, which propagates the mission
+       orbit with the C++ RK4 integrator and screens it against the catalog.
+    4. Rejects candidates closer than threshold_m (scores them 1e10).
+    5. Scores the rest by negated closest-approach distance (see
+       _mission_objective), so minimising maximises conjunction margin.
 
     Args:
         bounds:           OrbitalBounds from the constraint solver
@@ -214,7 +217,7 @@ def run_optimizer(
         # Pre-propagation screen — O(1) Keplerian arithmetic per candidate, no
         # integrator call. Degenerate orbits (perigee inside the atmosphere,
         # apogee out of the LEO shell, mission shorter than one orbit) never
-        # reach the OpenMP kernel or the conjunction check.
+        # reach the integrator or the conjunction check.
         keep = np.fromiter(
             (screen.check_pre_propagation(*row, n_steps=n_steps, dt=dt)[0]
              for row in population),
@@ -257,7 +260,7 @@ def run_optimizer(
     result = differential_evolution(
         batch_fitness,
         bounds=scipy_bounds,
-        workers=1,           # OpenMP handles parallelism inside C++; don't fight it
+        workers=1,           # required: scipy overrides vectorized=True when workers != 1
         updating="deferred", # collect full population before evaluating → enables batching
         popsize=popsize,
         maxiter=maxiter,

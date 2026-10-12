@@ -72,7 +72,7 @@ StateVector rk4_step(const StateVector& s, double dt) {
 
 // Returns only the terminal state after n_steps steps.
 // Avoids allocating an (n_steps+1)-length trajectory vector, which matters
-// because the optimizer calls this thousands of times per run.
+// when only the endpoint is needed.
 StateVector propagate_final(const StateVector& s0, double dt, int n_steps) {
     StateVector s = s0;
     for (int i = 0; i < n_steps; ++i) {

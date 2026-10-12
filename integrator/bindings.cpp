@@ -44,13 +44,13 @@ arr py_propagate_single(const arr& state0, double dt, int n_steps) {
 
 // propagate_single_final: (6,) -> (6,)
 // Returns only the terminal state; cheaper than propagate_single when the
-// intermediate trajectory is not needed (e.g., optimizer cost evaluation).
+// intermediate trajectory is not needed (e.g., stepping the ground-track sampler).
 arr py_propagate_single_final(const arr& state0, double dt, int n_steps) {
     return sv_to_arr(propagate_final(arr_to_sv(state0), dt, n_steps));
 }
 
 // propagate_batch: (N,6) -> (N, n_steps+1, 6)
-// Full trajectories for N orbits, parallelised with OpenMP inside propagate().
+// Full trajectories for N orbits, parallelised with OpenMP over the orbits below.
 arr py_propagate_batch(const arr& states0, double dt, int n_steps) {
     auto buf = states0.request();
     if (buf.ndim != 2 || buf.shape[1] != 6)
@@ -89,8 +89,9 @@ arr py_propagate_batch(const arr& states0, double dt, int n_steps) {
 }
 
 // propagate_batch_final: (N,6) -> (N,6)
-// Terminal states only for N orbits; used by the optimizer's inner loop where
-// storing full trajectories would be prohibitively expensive in memory.
+// Terminal states only for N orbits; no production caller (the optimizer propagates
+// each candidate once inside nearest_approach). Skips storing full trajectories,
+// which for N orbits would be expensive in memory.
 arr py_propagate_batch_final(const arr& states0, double dt, int n_steps) {
     auto buf = states0.request();
     if (buf.ndim != 2 || buf.shape[1] != 6)
